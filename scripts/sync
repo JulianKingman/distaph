@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""sync — the whole fact pipeline in one command, plus the review note.
+
+Per specs/07-operations.md: chat-triggered or run by hand; idempotent (every
+stage skips already-processed work); fails loudly if the drive is unmounted.
+Chains ingest -> transcribe -> caption -> embed, then writes a review note
+into vault/review/ listing everything that needs a human call: undated clips,
+possible dupes, stage errors. Classification proposals are appended to the
+note by the skill in chat (judgment is not a script's job).
+
+The note is a DOCUMENT, not a form: only lines matching the strict checkbox
+grammar are machine-parsed by `apply-review`; all other text is yours —
+annotate freely. Undated/dupe sections are regenerated from DB state on every
+sync, so unticked items carry forward automatically and dismissed dupes
+(vault/review/resolved-dupes.md) stay dismissed.
+
+Ends by exporting text facts and committing the library, when the library
+is a git repo (it never pushes).
+
+Usage: scripts/sync [--skip STAGE ...] [--config PATH] [--db PATH] [--json]
+  STAGE in {ingest, transcribe, caption, embed}
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import commit_library, die, load_config, open_db, require_drive, vault_path
+
+STAGES = ["ingest", "transcribe", "caption", "embed"]
+SCRIPTS_DIR = Path(__file__).resolve().parent
+DUP_DURATION_TOL_S = 0.5
+
+
+def run_stage(name: str, passthrough: list[str]) -> dict:
+    # Children normally run via their own shebangs (uv resolves their deps);
+    # SYNC_CHILD_PYTHON overrides the interpreter — the test seam.
+    child = os.environ.get("SYNC_CHILD_PYTHON")
+    cmd = ([child] if child else []) + [str(SCRIPTS_DIR / name), "--json"] + passthrough
+    out = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        report = json.loads(out.stdout[out.stdout.index("{"):])
+    except (ValueError, json.JSONDecodeError):
+        report = {"unparseable_output": out.stdout[-400:]}
+    report["exit"] = out.returncode
+    if out.returncode != 0 and out.stderr.strip():
+        report["stderr"] = out.stderr.strip()[-400:]
+    return report
+
+
+def capture_utc(iso: str | None) -> str | None:
+    if not iso:
+        return None
+    dt = datetime.fromisoformat(iso)
+    dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def resolved_dupes(vault: Path) -> set[frozenset]:
+    f = vault / "review" / "resolved-dupes.md"
+    if not f.exists():
+        return set()
+    return {frozenset(m.groups())
+            for m in re.finditer(r"(clip_\w+) ~ (clip_\w+)", f.read_text())}
+
+
+def possible_dupes(conn, vault: Path) -> list[dict]:
+    """Recomputed from DB state each sync — dismissals live in the vault, so
+    unticked pairs carry forward and dismissed ones stay gone."""
+    clips = [dict(r) for r in conn.execute(
+        "SELECT id, source_name, duration_s, capture_date, take_group FROM clip")]
+    for c in clips:
+        c["utc"] = capture_utc(c["capture_date"])
+    dismissed = resolved_dupes(vault)
+    pairs = []
+    for i, a in enumerate(clips):
+        for b in clips[i + 1:]:
+            if a["take_group"] and a["take_group"] == b["take_group"]:
+                continue
+            if frozenset((a["id"], b["id"])) in dismissed:
+                continue
+            same_ts = a["utc"] is not None and a["utc"] == b["utc"]
+            near_dur = (a["duration_s"] is not None and b["duration_s"] is not None
+                        and abs(a["duration_s"] - b["duration_s"]) <= DUP_DURATION_TOL_S)
+            if same_ts or near_dur:
+                pairs.append({"a": a, "b": b,
+                              "reason": "capture-timestamp" if same_ts else "duration"})
+    return pairs
+
+
+def write_note(vault: Path, conn, stages: dict) -> Path:
+    review = vault / "review"
+    review.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc)
+    note = review / f"{now.strftime('%Y-%m-%d-%H%M')}.md"
+
+    lines = [
+        "---", "type: review", f"created: {now.isoformat(timespec='seconds')}",
+        "status: open", "---",
+        f"# Review — {now.strftime('%Y-%m-%d %H:%M')} UTC", "",
+        "Only checkbox lines in the strict grammar are machine-parsed; edit a",
+        "line before ticking and the edited version is what applies. Everything",
+        "else in this note is yours — annotate freely.", "",
+    ]
+
+    ingested = stages.get("ingest", {}).get("ingested", [])
+    if ingested:
+        lines += ["## ingested", ""]
+        lines += [f"- {i['clip_id']} — {i['file']} ({i['capture_date'] or 'UNDATED'})"
+                  for i in ingested] + [""]
+
+    undated = conn.execute(
+        "SELECT id, source_name FROM clip WHERE capture_date IS NULL").fetchall()
+    if undated:
+        lines += ["## undated", "",
+                  "Fill in the date and tick — `capture_date_source` becomes 'manual'.", ""]
+        lines += [f"- [ ] date {r['id']} = YYYY-MM-DD — {r['source_name']}"
+                  for r in undated] + [""]
+
+    dupes = possible_dupes(conn, vault)
+    if dupes:
+        lines += ["## possible dupes", "",
+                  "Tick to dismiss a pair permanently (recorded in resolved-dupes.md).", ""]
+        lines += [f"- [ ] dupe {d['a']['id']} ~ {d['b']['id']} — {d['reason']} "
+                  f"({d['a']['source_name']} / {d['b']['source_name']})"
+                  for d in dupes] + [""]
+
+    lines += ["## proposals", "",
+              "Classification proposals are appended here in chat (the skill",
+              "reads new clips against the taxonomy). Hand-written lines in the",
+              "same grammar work too: `- [ ] clip_xxx → project/slug — note`", ""]
+
+    errors = {s: r for s, r in stages.items()
+              if r.get("exit") not in (0, None) or r.get("errors")}
+    if errors:
+        lines += ["## stage errors", ""]
+        for s, r in errors.items():
+            for e in r.get("errors", []) or [r.get("stderr", "nonzero exit")]:
+                lines.append(f"- {s}: {json.dumps(e) if isinstance(e, dict) else e}")
+        lines.append("")
+
+    note.write_text("\n".join(lines))
+    return note
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--skip", action="append", default=[], choices=STAGES)
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    require_drive(cfg)
+    vault = vault_path(cfg)
+
+    passthrough = []
+    if args.config:
+        passthrough += ["--config", args.config]
+    if args.db:
+        passthrough += ["--db", args.db]
+
+    stages = {}
+    for stage in STAGES:
+        if stage in args.skip:
+            stages[stage] = {"skipped": True}
+            continue
+        stages[stage] = run_stage(stage, passthrough)
+        if not args.as_json:
+            status = "FAILED" if stages[stage].get("exit") else "ok"
+            print(f"{stage}: {status}", flush=True)
+
+    conn = open_db(cfg, args.db)
+    note = write_note(vault, conn, stages)
+    commit = commit_library(cfg, conn, f"sync: review note {note.name}")
+
+    failed = [s for s, r in stages.items() if r.get("exit") not in (0, None)]
+    report = {"stages": stages, "note": str(note), "vault_commit": commit,
+              "failed_stages": failed}
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"review note: {note}")
+        print(f"vault: {commit}")
+        if failed:
+            print(f"FAILED stages: {', '.join(failed)}", file=sys.stderr)
+    sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":
+    main()

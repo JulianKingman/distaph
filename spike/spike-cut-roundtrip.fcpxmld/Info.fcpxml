@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.10">
+    <resources>
+        <format height="1920" width="1080" id="r0" frameDuration="1/24s" name="FFVideoFormatRateUndefined"/>
+        <format height="1920" width="1080" id="r2" frameDuration="1/30s" name="FFVideoFormatRateUndefined"/>
+        <asset audioChannels="1" hasVideo="1" start="0/1s" hasAudio="1" format="r0" id="r1" duration="505/24s" name="clip-a.mov" audioSources="1">
+            <media-rep kind="original-media" src="file:///Volumes/ARCHIVE/footage/clip-a.mov"/>
+        </asset>
+        <asset audioChannels="2" hasVideo="1" start="0/1s" hasAudio="1" format="r2" id="r3" duration="3373/10s" name="clip-b.mov" audioSources="1">
+            <media-rep kind="original-media" src="file:///Volumes/ARCHIVE/footage/clip-b.mov"/>
+        </asset>
+    </resources>
+    <library>
+        <event name="spike-cut (Resolve)">
+            <project name="spike-cut (Resolve)">
+                <sequence tcStart="0/1s" format="r0" tcFormat="NDF" duration="20/1s">
+                    <spine>
+                        <asset-clip enabled="1" start="5/1s" offset="0/1s" format="r0" tcFormat="NDF" duration="10/1s" ref="r1" name="clip-a.mov">
+                            <adjust-conform type="fit"/>
+                            <adjust-transform position="0 0" scale="1 1" anchor="0 0"/>
+                        </asset-clip>
+                        <asset-clip enabled="1" start="901/30s" offset="10/1s" format="r2" tcFormat="NDF" duration="10/1s" ref="r3" name="clip-b.mov">
+                            <adjust-conform type="fit"/>
+                            <adjust-transform position="0 0" scale="1 1" anchor="0 0"/>
+                        </asset-clip>
+                    </spine>
+                </sequence>
+            </project>
+        </event>
+    </library>
+</fcpxml>

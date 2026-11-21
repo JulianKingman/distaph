@@ -1,0 +1,135 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["sentence-transformers"]
+# ///
+"""embed — segment, keyframe-caption & visual-summary embeddings.
+
+Per specs/05-retrieval.md: three granularities. ref_type 'segment' finds exact
+lines, 'keyframe' finds visuals, 'visual_summary' finds visual themes;
+'summary' (clip/narrative summaries) joins once `summarize` exists.
+
+Incremental by default: only refs missing a row for the configured model are
+encoded. Segments never mutate under an ID (generation tokens), so
+missing-check is sufficient for them. Keyframe captions and visual summaries
+CAN change under a stable ID (re-caption) — pass explicit clip_ids to
+delete + re-embed a clip's refs; `sync` wires that after re-captioning.
+
+Vectors are float32 blobs (sqlite-vec-compatible layout), L2-normalized at
+encode time so search ranks by plain dot product. Query/passage prefixes
+(E5-style models) come from config, not hidden model knowledge.
+
+Usage: scripts/embed [--config PATH] [--db PATH] [--json] [clip_id ...]
+"""
+
+import argparse
+import json
+import struct
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import die, load_config, open_db, require_drive
+
+
+def embedder_config(cfg: dict) -> tuple[str, str]:
+    models = cfg.get("models", {})
+    model = models.get("embedder", "TBD")
+    if not model or model == "TBD":
+        die("config [models].embedder is unset — run the bake-off and set it")
+    return model, models.get("embedder_passage_prefix", "")
+
+
+def pack(vec) -> bytes:
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+def gather(conn, clip_ids: list[str]) -> list[tuple[str, str, str]]:
+    """(ref_type, ref_id, text) for every embeddable fact, optionally scoped."""
+    scope_seg = scope_kf = scope_clip = ""
+    params: list[str] = []
+    if clip_ids:
+        ph = ",".join("?" * len(clip_ids))
+        scope_seg = f"WHERE clip_id IN ({ph})"
+        scope_kf = f"WHERE clip_id IN ({ph})"
+        scope_clip = f"AND id IN ({ph})"
+        params = clip_ids
+    out = []
+    out += [("segment", r["id"], r["text"]) for r in conn.execute(
+        f"SELECT id, text FROM segment {scope_seg}", params)]
+    out += [("keyframe", r["id"], r["caption"]) for r in conn.execute(
+        f"SELECT id, caption FROM keyframe {scope_kf}", params)]
+    out += [("visual_summary", r["id"], r["visual_summary"]) for r in conn.execute(
+        f"SELECT id, visual_summary FROM clip "
+        f"WHERE visual_summary IS NOT NULL {scope_clip}", params)]
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("clip_ids", nargs="*",
+                    help="force delete + re-embed of these clips' refs")
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    require_drive(cfg)
+    model_name, passage_prefix = embedder_config(cfg)
+    conn = open_db(cfg, args.db)
+
+    if args.clip_ids:
+        for cid in args.clip_ids:
+            if not conn.execute("SELECT 1 FROM clip WHERE id = ?", (cid,)).fetchone():
+                die(f"unknown clip id: {cid}")
+
+    targets = gather(conn, args.clip_ids)
+    if args.clip_ids:
+        refs = [(t, r) for t, r, _ in targets]
+        conn.execute("BEGIN")
+        conn.executemany(
+            "DELETE FROM embedding WHERE ref_type = ? AND ref_id = ? AND model = ?",
+            [(t, r, model_name) for t, r in refs])
+        conn.execute("COMMIT")
+    else:
+        have = {(r["ref_type"], r["ref_id"]) for r in conn.execute(
+            "SELECT ref_type, ref_id FROM embedding WHERE model = ?", (model_name,))}
+        targets = [t for t in targets if (t[0], t[1]) not in have]
+
+    report = {"model": model_name,
+              "embedded": {t: 0 for t in ("segment", "keyframe", "visual_summary")}}
+    if targets:
+        from sentence_transformers import SentenceTransformer  # deferred: slow
+        model = SentenceTransformer(model_name)
+        t0 = time.time()
+        vecs = model.encode([passage_prefix + text for _, _, text in targets],
+                            normalize_embeddings=True, batch_size=64,
+                            show_progress_bar=False)
+        conn.execute("BEGIN")
+        try:
+            conn.executemany(
+                "INSERT INTO embedding (ref_type, ref_id, model, vec) "
+                "VALUES (?,?,?,?)",
+                [(t, r, model_name, pack(v))
+                 for (t, r, _), v in zip(targets, vecs)])
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        for t, _, _ in targets:
+            report["embedded"][t] += 1
+        report["wall_s"] = round(time.time() - t0, 1)
+
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        e = report["embedded"]
+        print(f"embedded {sum(e.values())} texts with {model_name} "
+              f"({e['segment']} segments, {e['keyframe']} keyframes, "
+              f"{e['visual_summary']} visual summaries)")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,20 @@
+# Your Distaph library settings. Paths that aren't absolute are relative to
+# this folder. Scripts read this and fail loudly if anything is missing — they
+# never guess.
+
+[media]
+drive = "/Volumes/CHANGEME"                   # the drive that holds your footage
+intake = "/Volumes/CHANGEME/Video/intake"     # drop new footage here
+archive = "/Volumes/CHANGEME/Video/archive"   # content-addressed store; Distaph manages it
+
+[db]
+path = "db/archive.sqlite"   # not versioned; rebuilt from facts/ + `distaph embed`
+
+[vault]
+path = "vault"               # open this folder in Obsidian
+
+[models]
+whisper = "mlx-community/whisper-large-v3-mlx"
+vlm = "mlx-community/Qwen2.5-VL-7B-Instruct-4bit"
+embedder = "BAAI/bge-small-en-v1.5"
+embedder_query_prefix = "Represent this sentence for searching relevant passages: "

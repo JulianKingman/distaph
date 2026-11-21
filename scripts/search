@@ -1,0 +1,117 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["sentence-transformers"]
+# ///
+"""search — filter-before-rank retrieval; returns IDs, never conjured text.
+
+Per specs/05-retrieval.md: scope candidates by metadata FIRST (project, date
+window, clip set), then rank the survivors by exact cosine against the query
+embedding. Exact beats approximate at this scale; no ANN index. Results are
+segment/keyframe/clip IDs plus a human-readable echo — the DB remains the
+authority for what any ID resolves to.
+
+Levels: segment (find the exact line), keyframe (find the shot),
+visual_summary (find the clip by visual theme).
+
+Usage: scripts/search "query text" [--level segment|keyframe|visual_summary]
+                      [--k N] [--after ISO] [--before ISO] [--clip ID ...]
+                      [--project SLUG ...] [--config PATH] [--db PATH]
+"""
+
+import argparse
+import json
+import struct
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import die, load_config, open_db, require_drive
+
+LEVEL_SQL = {
+    "segment": """
+        SELECT s.id, s.clip_id, s.t_in, s.t_out, s.text AS echo, e.vec
+        FROM segment s
+        JOIN embedding e ON e.ref_type='segment' AND e.ref_id = s.id AND e.model = ?
+        JOIN clip c ON c.id = s.clip_id""",
+    "keyframe": """
+        SELECT k.id, k.clip_id, k.t, k.caption AS echo, e.vec
+        FROM keyframe k
+        JOIN embedding e ON e.ref_type='keyframe' AND e.ref_id = k.id AND e.model = ?
+        JOIN clip c ON c.id = k.clip_id""",
+    "visual_summary": """
+        SELECT c.id, c.id AS clip_id, c.capture_date, c.visual_summary AS echo, e.vec
+        FROM clip c
+        JOIN embedding e ON e.ref_type='visual_summary' AND e.ref_id = c.id
+         AND e.model = ?""",
+}
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("query")
+    ap.add_argument("--level", choices=list(LEVEL_SQL), default="segment")
+    ap.add_argument("--k", type=int, default=12)
+    ap.add_argument("--after", help="capture_date lower bound (ISO)")
+    ap.add_argument("--before", help="capture_date upper bound (ISO)")
+    ap.add_argument("--clip", action="append", default=[],
+                    help="restrict to these clip ids (repeatable)")
+    ap.add_argument("--project", action="append", default=[],
+                    help="restrict to confirmed members of these projects")
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--json", action="store_true",
+                    help="accepted for CLI consistency; output is always JSON")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    require_drive(cfg)
+    models = cfg.get("models", {})
+    model_name = models.get("embedder", "TBD")
+    if not model_name or model_name == "TBD":
+        die("config [models].embedder is unset — run the bake-off and set it")
+    conn = open_db(cfg, args.db)
+
+    # Filter BEFORE rank: metadata scoping shrinks the candidate set so cosine
+    # ranks the relevant few, not the self-similar many.
+    sql, params = LEVEL_SQL[args.level], [model_name]
+    where = []
+    if args.after:
+        where.append("c.capture_date >= ?"); params.append(args.after)
+    if args.before:
+        where.append("c.capture_date <= ?"); params.append(args.before)
+    if args.clip:
+        where.append(f"c.id IN ({','.join('?' * len(args.clip))})")
+        params += args.clip
+    if args.project:
+        where.append(f"c.id IN (SELECT clip_id FROM clip_project WHERE project "
+                     f"IN ({','.join('?' * len(args.project))}))")
+        params += args.project
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    candidates = conn.execute(sql, params).fetchall()
+
+    results = []
+    if candidates:
+        from sentence_transformers import SentenceTransformer  # deferred: slow
+        q_vec = SentenceTransformer(model_name).encode(
+            [models.get("embedder_query_prefix", "") + args.query],
+            normalize_embeddings=True, show_progress_bar=False)[0]
+        q = list(map(float, q_vec))
+        scored = []
+        for row in candidates:
+            v = struct.unpack(f"{len(q)}f", row["vec"])
+            scored.append((sum(a * b for a, b in zip(q, v)), row))
+        scored.sort(key=lambda x: -x[0])
+        for score, row in scored[: args.k]:
+            r = {k: row[k] for k in row.keys() if k != "vec"}
+            r["score"] = round(score, 4)
+            results.append(r)
+
+    print(json.dumps({"level": args.level, "query": args.query,
+                      "candidates": len(candidates), "results": results},
+                     indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

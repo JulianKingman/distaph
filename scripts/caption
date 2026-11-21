@@ -1,0 +1,238 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["mlx-vlm"]
+# ///
+"""caption — keyframe extraction + local VLM captions + clip visual summary.
+
+Per specs/06-skill.md: keyframes come from ffmpeg scene detection with a
+fixed-interval fallback for continuous single-take footage (the normal case in
+this corpus — raw takes have no cuts). Captions run on BOTH angles of a take
+group (the visuals differ; only audio is deduped). The clip-level
+visual_summary is generated from the ordered captions and staleness-tracked
+via visual_summary_input_hash (sha256 of the joined captions).
+
+Re-captioning explicit clip_ids is destructive: old keyframe rows are replaced.
+The `model` column records which VLM produced each caption.
+
+Usage: scripts/caption [--config PATH] [--db PATH] [--limit N] [--json]
+                       [clip_id ...]
+"""
+
+import argparse
+import hashlib
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import die, load_config, open_db, require_drive
+
+SCENE_THRESHOLD = 0.35
+INTERVAL_S = 30.0
+FIRST_FRAME_S = 5.0
+MAX_FRAMES = 24
+NUDGE_S = 2.0     # retry offset for a bad frame (aim-blur/black passes quickly)
+MIN_LUMA = 20.0   # YAVG below this = near-black; VLM collapses on those.
+                  # Limited-range video puts black at Y=16, so the floor sits
+                  # above 16 — 10 silently never fired on real footage.
+FRAME_PROMPT = ("Describe this video frame in one dense sentence: subject, "
+                "action, setting, notable objects. No preamble.")
+SUMMARY_PROMPT = ("These are captions of frames sampled in order from one "
+                  "continuous video clip. Write 1-2 sentences describing what "
+                  "the clip shows visually. No preamble.\n\n{captions}")
+
+
+def vlm_model(cfg: dict) -> str:
+    model = cfg.get("models", {}).get("vlm", "TBD")
+    if not model or model == "TBD":
+        die("config [models].vlm is unset — run the bake-off and set it")
+    return model
+
+
+def scene_change_times(path: Path) -> list[float]:
+    out = subprocess.run(
+        ["ffmpeg", "-v", "info", "-i", str(path),
+         "-vf", f"select='gt(scene,{SCENE_THRESHOLD})',showinfo",
+         "-fps_mode", "vfr", "-f", "null", "-"],
+        capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(f"ffmpeg scene detect failed: {out.stderr[-300:]}")
+    return [round(float(m), 2)
+            for m in re.findall(r"pts_time:([0-9.]+)", out.stderr)]
+
+
+def keyframe_times(path: Path, duration_s: float) -> tuple[list[float], str]:
+    """Scene-change times, or a fixed grid when the clip is one continuous
+    shot. Returns (times, method)."""
+    scene = scene_change_times(path)
+    if len(scene) >= max(2, int(duration_s // 45)):
+        times, method = scene, "scene"
+    else:
+        t, times = FIRST_FRAME_S, []
+        while t < duration_s - 1:
+            times.append(round(t, 2))
+            t += INTERVAL_S
+        times, method = times or [round(duration_s / 2, 2)], "interval"
+    if len(times) > MAX_FRAMES:
+        step = len(times) / MAX_FRAMES
+        times = [times[int(i * step)] for i in range(MAX_FRAMES)]
+    return times, method
+
+
+def extract_frame(path: Path, t: float, dest: Path):
+    # PNG, not JPEG: ffmpeg 7's mjpeg encoder rejects YUV with untagged/limited
+    # color range (real iPhone footage in this corpus); PNG has no such rule.
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-y", "-ss", str(t), "-i", str(path),
+         "-frames:v", "1", str(dest)],
+        capture_output=True, text=True)
+    if out.returncode != 0 or not dest.exists():
+        raise RuntimeError(f"frame extract failed at t={t}: {out.stderr.strip()}")
+
+
+def frame_luma(frame: Path) -> float:
+    out = subprocess.run(
+        ["ffmpeg", "-v", "info", "-i", str(frame),
+         "-vf", "signalstats,metadata=print:file=-", "-f", "null", "-"],
+        capture_output=True, text=True)
+    m = re.search(r"YAVG=([0-9.]+)", out.stdout + out.stderr)
+    if not m:
+        raise RuntimeError(f"signalstats failed for {frame.name}")
+    return float(m.group(1))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("clip_ids", nargs="*")
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    require_drive(cfg)
+    model_repo = vlm_model(cfg)
+    conn = open_db(cfg, args.db)
+
+    if args.clip_ids:
+        clips = []
+        for cid in args.clip_ids:
+            row = conn.execute("SELECT * FROM clip WHERE id = ?", (cid,)).fetchone()
+            if row is None:
+                die(f"unknown clip id: {cid}")
+            clips.append(row)
+    else:
+        clips = conn.execute(
+            "SELECT * FROM clip WHERE id NOT IN "
+            "(SELECT DISTINCT clip_id FROM keyframe) ORDER BY capture_date").fetchall()
+        if args.limit:
+            clips = clips[: args.limit]
+
+    from mlx_vlm import load, generate  # deferred: slow import
+    from mlx_vlm.prompt_utils import apply_chat_template
+    model, processor = load(model_repo)
+
+    def ask(prompt: str, images: list[str]) -> str:
+        chat = apply_chat_template(processor, model.config, prompt,
+                                   num_images=len(images))
+        r = generate(model, processor, chat, image=images or None,
+                     max_tokens=160, temperature=0.0, verbose=False)
+        text = (r.text if hasattr(r, "text") else str(r)).strip()
+        # Qwen2.5-VL via mlx-vlm leaks turn-leader junk ahead of the caption
+        # (`<|im_start|>`, `addCriterion`); confirmed with mlx_vlm's own CLI.
+        # Strip that known prefix only — an all-junk reply is still an error.
+        lines = text.splitlines()
+        while lines and (not lines[0].strip()
+                         or lines[0].strip().startswith("<|")
+                         or lines[0].strip() == "addCriterion"):
+            lines.pop(0)
+        cleaned = "\n".join(lines).strip()
+        if not cleaned:
+            raise RuntimeError(f"VLM returned no content (raw: {text[:80]!r})")
+        return cleaned
+
+    report = {"model": model_repo, "captioned": [], "errors": []}
+    for clip in clips:
+        path = Path(clip["path"])
+        if not path.exists():
+            report["errors"].append({"clip_id": clip["id"],
+                                     "error": f"media missing: {path}"})
+            continue
+        t0 = time.time()
+        try:
+            times, method = keyframe_times(path, clip["duration_s"])
+            kept_times, captions, skipped = [], [], []
+            with tempfile.TemporaryDirectory() as tmp:
+                for t in times:
+                    last_err = None
+                    for attempt in (t, round(t + NUDGE_S, 2)):
+                        if attempt > clip["duration_s"] - 0.5 or attempt in kept_times:
+                            continue
+                        frame = Path(tmp) / f"{attempt}.png"
+                        try:
+                            extract_frame(path, attempt, frame)
+                            if (luma := frame_luma(frame)) < MIN_LUMA:
+                                last_err = f"near-black frame (YAVG={luma}) at t={attempt}"
+                                continue
+                            captions.append(ask(FRAME_PROMPT, [str(frame)]))
+                            kept_times.append(attempt)
+                            last_err = None
+                            break
+                        except RuntimeError as e:
+                            last_err = f"t={attempt}: {e}"
+                    if last_err:
+                        skipped.append(last_err)
+            if not captions:
+                raise RuntimeError(f"no frame produced a caption; {skipped}")
+            # First sentence of each caption only: feeding 20+ full paragraphs
+            # from a long clip collapses the model the same way bad frames do.
+            gist = [re.split(r"(?<=[.!?])\s", c.replace("\n", " "))[0]
+                    for c in captions]
+            summary = ask(SUMMARY_PROMPT.format(
+                captions="\n".join(f"- {g}" for g in gist)), [])
+        except RuntimeError as e:
+            report["errors"].append({"clip_id": clip["id"], "error": str(e)})
+            continue
+
+        input_hash = hashlib.sha256("\n".join(captions).encode()).hexdigest()
+        hash_tail = clip["id"].removeprefix("clip_")
+        conn.execute("BEGIN")
+        try:
+            conn.execute("DELETE FROM keyframe WHERE clip_id = ?", (clip["id"],))
+            conn.executemany(
+                "INSERT INTO keyframe (id, clip_id, t, caption, model) "
+                "VALUES (?,?,?,?,?)",
+                [(f"kf_{hash_tail}_{i:04d}", clip["id"], t, c, model_repo)
+                 for i, (t, c) in enumerate(zip(kept_times, captions))])
+            conn.execute(
+                "UPDATE clip SET visual_summary = ?, visual_summary_input_hash = ? "
+                "WHERE id = ?", (summary, input_hash, clip["id"]))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        report["captioned"].append({
+            "clip_id": clip["id"], "keyframes": len(kept_times), "method": method,
+            "skipped_frames": skipped, "wall_s": round(time.time() - t0, 1)})
+        if not args.as_json:
+            r = report["captioned"][-1]
+            print(f"{r['clip_id']}: {r['keyframes']} keyframes ({r['method']}, "
+                  f"{r['wall_s']}s)", flush=True)
+
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"captioned {len(report['captioned'])} clip(s) with {model_repo}")
+        for e in report["errors"]:
+            print(f"  ERROR {e['clip_id']}: {e['error']}")
+    sys.exit(1 if report["errors"] else 0)
+
+
+if __name__ == "__main__":
+    main()

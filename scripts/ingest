@@ -1,0 +1,253 @@
+#!/usr/bin/env python3
+"""ingest — catalog intake footage into the content-addressed archive.
+
+Per specs/06-skill.md: probe (ffprobe), hash, capture-date extract, move
+intake -> archive (the one sanctioned move), write clip rows, pair DoubleTake
+A/B take groups, flag possible dupes (duration ±0.5s or matching capture
+timestamp; take_group siblings excluded).
+
+Facts only, no judgment. Flags land in the run report (stdout / --json); the
+review note is written by `sync`, which consumes this report.
+
+Usage: scripts/ingest [--config PATH] [--db PATH] [--dry-run] [--limit N] [--json]
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import die, load_config, open_db, require_drive
+
+VIDEO_EXTS = {".mov", ".mp4", ".m4v", ".mts", ".avi", ".mkv"}
+DUP_DURATION_TOL_S = 0.5
+TAKE_ANGLE_RE = re.compile(r"^(?P<stem>.+)_(?P<angle>[AB])$", re.IGNORECASE)
+HASH_PREFIX_LEN = 12
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(8 * 1024 * 1024):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def ffprobe(path: Path) -> dict:
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-print_format", "json",
+         "-show_format", "-show_streams", str(path)],
+        capture_output=True, text=True)
+    if out.returncode != 0:
+        raise RuntimeError(f"ffprobe failed: {out.stderr.strip()}")
+    return json.loads(out.stdout)
+
+
+def parse_capture_date(probe: dict) -> str | None:
+    """Embedded capture date, never file mtime (specs/03-roadmap.md).
+
+    com.apple.quicktime.creationdate carries local time + offset and is
+    preferred; creation_time is UTC. Missing -> None, flagged for later
+    inference — no silent mtime fallback.
+    """
+    tags = probe.get("format", {}).get("tags", {})
+    for key in ("com.apple.quicktime.creationdate", "creation_time"):
+        raw = tags.get(key)
+        if raw:
+            dt = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+            return dt.isoformat(timespec="seconds")
+    return None
+
+
+def capture_utc_second(iso: str | None) -> str | None:
+    if not iso:
+        return None
+    dt = datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        # Assume UTC for naive embedded times; comparison key only, the stored
+        # value keeps whatever the container said.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def probe_facts(probe: dict) -> dict:
+    fmt = probe.get("format", {})
+    video = next((s for s in probe.get("streams", [])
+                  if s.get("codec_type") == "video"), None)
+    if video is None:
+        raise RuntimeError("no video stream")
+    num, _, den = video.get("r_frame_rate", "0/1").partition("/")
+    fps = round(int(num) / int(den or 1), 3) if den and int(den) else None
+    tc = fmt.get("tags", {}).get("timecode")
+    if tc is None:
+        tc = next((s.get("tags", {}).get("timecode")
+                   for s in probe.get("streams", [])
+                   if s.get("tags", {}).get("timecode")), None)
+    return {
+        "duration_s": float(fmt["duration"]),
+        "fps": fps,
+        "codec": video.get("codec_name"),
+        "width": video.get("width"),
+        "height": video.get("height"),
+        "start_tc": tc,
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--config")
+    ap.add_argument("--db", help="override db path (testing)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="probe/hash/plan only; no moves, no DB writes")
+    ap.add_argument("--limit", type=int, help="ingest at most N files")
+    ap.add_argument("--json", action="store_true", dest="as_json",
+                    help="emit the run report as JSON")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    intake, archive = require_drive(cfg)
+    conn = open_db(cfg, args.db)
+
+    files = sorted(p for p in intake.iterdir()
+                   if p.suffix.lower() in VIDEO_EXTS and not p.name.startswith("."))
+    if args.limit:
+        files = files[: args.limit]
+
+    # Existing facts, loaded once for dupe/take-group comparison (10^4 scale).
+    known = [dict(r) for r in conn.execute(
+        "SELECT id, source_name, duration_s, capture_date, take_group FROM clip")]
+    for k in known:
+        k["capture_utc"] = capture_utc_second(k["capture_date"])
+
+    report = {"ingested": [], "take_groups": {}, "exact_dupes": [],
+              "possible_dupes": [], "undated": [], "errors": []}
+
+    for path in files:
+        try:
+            content_hash = sha256_file(path)
+            probe = ffprobe(path)
+        except (RuntimeError, OSError, json.JSONDecodeError, KeyError, ValueError) as e:
+            report["errors"].append({"file": path.name, "error": str(e)})
+            continue
+
+        existing = conn.execute(
+            "SELECT id FROM clip WHERE content_hash = ?", (content_hash,)).fetchone()
+        if existing:
+            report["exact_dupes"].append(
+                {"file": path.name, "clip_id": existing["id"]})
+            continue  # left in intake for a human call — never silently deleted
+
+        clip_id = f"clip_{content_hash[:HASH_PREFIX_LEN]}"
+        collision = conn.execute(
+            "SELECT content_hash FROM clip WHERE id = ?", (clip_id,)).fetchone()
+        if collision:
+            die(f"hash-prefix collision on {clip_id} — lengthen HASH_PREFIX_LEN")
+
+        facts = probe_facts(probe)
+        capture_date = parse_capture_date(probe)
+        capture_utc = capture_utc_second(capture_date)
+        if capture_date is None:
+            report["undated"].append({"file": path.name, "clip_id": clip_id})
+
+        # DoubleTake A/B pairing: same filename stem, other angle, matching
+        # duration. Sibling may be in this batch (already ingested rows) or a
+        # previous run — both live in `known` by now.
+        take_group, canonical = None, 1
+        m = TAKE_ANGLE_RE.match(path.stem)
+        if m:
+            stem, angle = m.group("stem"), m.group("angle").upper()
+            other = "B" if angle == "A" else "A"
+            sib_re = re.compile(
+                rf"^{re.escape(stem)}_{other}\.[^.]+$", re.IGNORECASE)
+            sib = next((k for k in known if k["source_name"]
+                        and sib_re.match(k["source_name"])
+                        and abs(k["duration_s"] - facts["duration_s"]) <= DUP_DURATION_TOL_S),
+                       None)
+            if sib:
+                take_group, canonical = stem, (1 if angle == "A" else 0)
+                if not args.dry_run and sib["take_group"] != stem:
+                    conn.execute(
+                        "UPDATE clip SET take_group = ?, is_canonical_audio = ? WHERE id = ?",
+                        (stem, 1 if other == "A" else 0, sib["id"]))
+                sib["take_group"] = stem
+                report["take_groups"].setdefault(stem, []).append(sib["id"])
+            # A lone _B stays canonical: it's the only angle we have. If its _A
+            # arrives in a later run, the UPDATE above demotes it then.
+
+        for k in known:
+            if take_group and k["take_group"] == take_group:
+                continue  # same-take siblings share duration+timestamp by design
+            near_duration = (k["duration_s"] is not None and
+                             abs(k["duration_s"] - facts["duration_s"]) <= DUP_DURATION_TOL_S)
+            same_capture = (capture_utc is not None and k["capture_utc"] == capture_utc)
+            if near_duration or same_capture:
+                report["possible_dupes"].append({
+                    "clip_id": clip_id, "file": path.name, "against": k["id"],
+                    "reason": "capture-timestamp" if same_capture else "duration"})
+
+        dest = archive / content_hash[:2] / f"{content_hash}{path.suffix.lower()}"
+        if not args.dry_run:
+            if dest.exists():
+                die(f"archive collision: {dest} exists but hash not in DB")
+            dest.parent.mkdir(exist_ok=True)
+            # Row and move commit together; rename is atomic (same volume).
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    """INSERT INTO clip (id, source_name, path, content_hash,
+                         duration_s, fps, start_tc, capture_date, capture_date_source,
+                         codec, width, height, take_group, is_canonical_audio, ingested_at)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (clip_id, path.name, str(dest), content_hash,
+                     facts["duration_s"], facts["fps"], facts["start_tc"],
+                     capture_date, "embedded" if capture_date else None,
+                     facts["codec"], facts["width"], facts["height"],
+                     take_group, canonical,
+                     datetime.now(timezone.utc).isoformat(timespec="seconds")))
+                os.rename(path, dest)
+                conn.execute("COMMIT")
+            except BaseException as e:
+                conn.execute("ROLLBACK")
+                if dest.exists() and not path.exists():
+                    os.rename(dest, path)  # undo the move; intake stays truthful
+                if isinstance(e, OSError):
+                    die(f"aborted: move failed for {path.name}: {e}")
+                raise
+
+        known.append({"id": clip_id, "source_name": path.name,
+                      "duration_s": facts["duration_s"], "capture_date": capture_date,
+                      "capture_utc": capture_utc, "take_group": take_group})
+        if take_group:
+            report["take_groups"].setdefault(take_group, []).append(clip_id)
+        report["ingested"].append({
+            "clip_id": clip_id, "file": path.name, "capture_date": capture_date,
+            "duration_s": facts["duration_s"],
+            "canonical_audio": bool(canonical), **({"dry_run": True} if args.dry_run else {})})
+
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        mode = " (dry run)" if args.dry_run else ""
+        print(f"ingested {len(report['ingested'])} clip(s){mode}, "
+              f"{len(report['take_groups'])} take group(s)")
+        for r in report["ingested"]:
+            print(f"  {r['clip_id']}  {r['file']}  {r['capture_date'] or 'UNDATED'}")
+        for label, key in [("exact dupes (left in intake)", "exact_dupes"),
+                           ("possible dupes", "possible_dupes"),
+                           ("undated", "undated"), ("errors", "errors")]:
+            if report[key]:
+                print(f"{label}:")
+                for item in report[key]:
+                    print(f"  {json.dumps(item)}")
+
+    sys.exit(1 if report["errors"] else 0)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""apply-review — parse ticked checkboxes; the only write path for judgments.
+
+Per specs/02-data-model.md: proposals live in the review note until a human
+ticks them. This script applies ticked lines, in three grammars (liberal on
+arrow style and trailing echo text; everything else in the note is ignored):
+
+  - [x] clip_xxx → project/slug — echo        confirm membership
+  - [x] date clip_xxx = 2026-07-18 — echo     set manual capture date
+  - [x] dupe clip_a ~ clip_b — note           dismiss a dupe pair for good
+
+Confirmed memberships are written to BOTH vault truth (a generator-owned
+`## clips` block in the project note) and the clip_project projection —
+the projection stays rebuildable from the vault. Dismissed dupes append to
+vault/review/resolved-dupes.md. Dates update the clip row (source 'manual').
+
+Partial application, not all-or-nothing: valid ticked lines apply even when
+others fail; failures are reported and the note stays in place (fix the line,
+re-run — everything is idempotent). Only a fully-clean apply archives the
+note to vault/review/archive/ and commits the vault.
+
+Usage: scripts/apply-review NOTE.md [--config PATH] [--db PATH] [--json]
+"""
+
+import argparse
+import json
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import commit_library, die, load_config, open_db, require_drive, vault_path
+
+MEM_RE = re.compile(r"^- \[[xX]\] (clip_\w+)\s*(?:→|->)\s*([\w./-]+?)(?:\s+—.*)?$")
+DATE_RE = re.compile(r"^- \[[xX]\] date (clip_\w+)\s*=\s*(\S+?)(?:\s+—.*)?$")
+DUPE_RE = re.compile(r"^- \[[xX]\] dupe (clip_\w+)\s*~\s*(clip_\w+).*$")
+CLIPS_HEADER = "## clips"
+CLIPS_MARKER = "<!-- generator-owned: confirmed memberships -->"
+
+
+def add_to_project_note(vault: Path, slug: str, clip_id: str, echo: str) -> str | None:
+    note = vault / "projects" / f"{slug}.md"
+    if not note.exists():
+        return f"no project note at vault/projects/{slug}.md"
+    text = note.read_text()
+    if CLIPS_HEADER not in text:
+        text = text.rstrip() + f"\n\n{CLIPS_HEADER}\n{CLIPS_MARKER}\n"
+    if clip_id not in text:
+        date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        head, _, tail = text.partition(CLIPS_MARKER)
+        text = f"{head}{CLIPS_MARKER}\n- {clip_id} — {echo} ({date})" + tail
+    note.write_text(text)
+    return None
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("note", help="review note path")
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    require_drive(cfg)
+    vault = vault_path(cfg)
+    conn = open_db(cfg, args.db)
+    note = Path(args.note)
+    if not note.exists():
+        die(f"review note not found: {note}")
+
+    report = {"applied": [], "failed": [], "unticked": 0}
+    for line in note.read_text().splitlines():
+        if re.match(r"^- \[ \]", line):
+            report["unticked"] += 1
+            continue
+
+        if m := MEM_RE.match(line):
+            clip_id, slug = m.groups()
+            clip = conn.execute("SELECT id, source_name FROM clip WHERE id = ?",
+                                (clip_id,)).fetchone()
+            if clip is None:
+                report["failed"].append({"line": line, "error": f"unknown clip {clip_id}"})
+                continue
+            err = add_to_project_note(vault, slug, clip_id, clip["source_name"] or "")
+            if err:
+                report["failed"].append({"line": line, "error": err})
+                continue
+            conn.execute("INSERT OR IGNORE INTO clip_project VALUES (?, ?)",
+                         (clip_id, slug))
+            report["applied"].append({"membership": f"{clip_id} → {slug}"})
+
+        elif m := DATE_RE.match(line):
+            clip_id, raw = m.groups()
+            try:
+                iso = datetime.fromisoformat(raw).isoformat(timespec="seconds")
+            except ValueError:
+                report["failed"].append(
+                    {"line": line, "error": f"unparseable date {raw!r}"})
+                continue
+            if conn.execute("UPDATE clip SET capture_date = ?, "
+                            "capture_date_source = 'manual' WHERE id = ?",
+                            (iso, clip_id)).rowcount == 0:
+                report["failed"].append({"line": line, "error": f"unknown clip {clip_id}"})
+                continue
+            report["applied"].append({"date": f"{clip_id} = {iso}"})
+
+        elif m := DUPE_RE.match(line):
+            a, b = m.groups()
+            resolved = vault / "review" / "resolved-dupes.md"
+            if not resolved.exists():
+                resolved.write_text("# Dismissed dupe pairs (machine-appended)\n")
+            if f"{a} ~ {b}" not in resolved.read_text():
+                date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                with open(resolved, "a") as f:
+                    f.write(f"- {a} ~ {b} — dismissed {date}\n")
+            report["applied"].append({"dupe_dismissed": f"{a} ~ {b}"})
+
+    report["ok"] = not report["failed"]
+    if report["ok"] and report["applied"]:
+        archive = vault / "review" / "archive"
+        archive.mkdir(parents=True, exist_ok=True)
+        archived = archive / note.name
+        archived.write_text(note.read_text().replace("status: open",
+                                                     "status: applied", 1))
+        note.unlink()
+        report["archived_to"] = str(archived)
+        report["vault_commit"] = commit_library(cfg, conn, f"apply-review: {note.name}")
+
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        for a in report["applied"]:
+            print(f"applied: {a}")
+        for f_ in report["failed"]:
+            print(f"FAILED: {f_['error']}  ({f_['line']})", file=sys.stderr)
+        print(f"{len(report['applied'])} applied, {len(report['failed'])} failed, "
+              f"{report['unticked']} unticked")
+    sys.exit(0 if report["ok"] else 1)
+
+
+if __name__ == "__main__":
+    main()

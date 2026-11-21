@@ -1,0 +1,51 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""export-facts — write the fact tables as sorted JSON Lines in <library>/facts/.
+
+Per specs/08-library-and-launcher.md: the SQLite file is not versioned (binary,
+undiffable, grows fast). The expensive facts — clips, transcripts, keyframe
+captions, confirmed project memberships — are versioned as text instead, so
+the DB can be rebuilt (`distaph import-facts`) without re-running Whisper.
+Embeddings are excluded: they rebuild from text in minutes (`distaph embed`).
+
+`sync` and `apply-review` run this automatically before committing the
+library. Run it by hand after editing the DB some other way.
+
+Usage: distaph export-facts [--out DIR] [--config PATH] [--db PATH] [--json]
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import export_facts, load_config, open_db
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out", help="output folder (default: <library>/facts)")
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    conn = open_db(cfg, args.db)
+    out = Path(args.out) if args.out else Path(cfg["_root"]) / "facts"
+    counts = export_facts(conn, out)
+    report = {"out": str(out), "rows": counts}
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        for table, n in counts.items():
+            print(f"{table}: {n} rows")
+        print(f"wrote {out}")
+
+
+if __name__ == "__main__":
+    main()

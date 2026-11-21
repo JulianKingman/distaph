@@ -1,0 +1,89 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""import-facts — rebuild the database from <library>/facts/*.jsonl.
+
+The inverse of export-facts (specs/08-library-and-launcher.md). Use it on a
+fresh machine, or after deleting a damaged DB: clone your library, run
+`distaph import-facts`, then `distaph embed` to regenerate embeddings.
+
+Refuses to run against a DB that already has clips unless --replace is given,
+in which case the fact tables are cleared first. Embeddings are left alone
+(stale ones are harmless: search only resolves IDs that exist).
+
+Usage: distaph import-facts [--from DIR] [--replace] [--config PATH] [--db PATH] [--json]
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import FACT_TABLES, die, load_config, open_db
+
+# Insert order respects foreign keys: clips before the rows that reference them.
+ORDER = ["clip", "segment", "keyframe", "clip_project"]
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--from", dest="src", help="facts folder (default: <library>/facts)")
+    ap.add_argument("--replace", action="store_true")
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    src = Path(args.src) if args.src else Path(cfg["_root"]) / "facts"
+    if not src.is_dir():
+        die(f"no facts folder at {src}")
+    conn = open_db(cfg, args.db)
+
+    existing = conn.execute("SELECT count(*) FROM clip").fetchone()[0]
+    if existing and not args.replace:
+        die(f"database already has {existing} clips; pass --replace to rebuild it")
+
+    counts = {}
+    conn.execute("BEGIN")
+    try:
+        if args.replace:
+            for table in reversed(ORDER):
+                conn.execute(f"DELETE FROM {table}")
+        for table in ORDER:
+            assert table in FACT_TABLES
+            f = src / f"{table}.jsonl"
+            n = 0
+            if f.exists():
+                cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})")]
+                for line in f.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    row = json.loads(line)
+                    keys = [c for c in cols if c in row]
+                    conn.execute(
+                        f"INSERT INTO {table} ({', '.join(keys)}) "
+                        f"VALUES ({', '.join('?' for _ in keys)})",
+                        [row[k] for k in keys])
+                    n += 1
+            counts[table] = n
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    report = {"from": str(src), "rows": counts,
+              "next": "run `distaph embed` to regenerate embeddings"}
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        for table, n in counts.items():
+            print(f"{table}: {n} rows")
+        print(report["next"])
+
+
+if __name__ == "__main__":
+    main()

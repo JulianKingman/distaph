@@ -1,0 +1,138 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["mlx-whisper"]
+# ///
+"""transcribe — local Whisper batch over canonical-audio clips.
+
+Per specs/02-data-model.md and 06-skill.md: sentence/utterance-grain segments
+(Whisper's punctuation-bounded segments) with word-level timings underneath.
+Re-transcription is DESTRUCTIVE by design: bump clip.transcribe_gen, delete the
+old generation's rows, insert the new. The r<gen> token in segment IDs is what
+makes that safe — stale references can never resolve against a new generation.
+
+Only canonical-audio angles are transcribed (a take group's _B would store the
+same words twice). The model comes from config [models].whisper (an mlx HF
+repo, decided by bake-off).
+
+Usage: scripts/transcribe [--config PATH] [--db PATH] [--limit N] [--json]
+                          [clip_id ...]
+  With no clip_ids: transcribe every canonical clip not yet transcribed.
+  With clip_ids: (re-)transcribe exactly those, bumping their generation.
+"""
+
+import argparse
+import json
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import die, load_config, open_db, require_drive
+
+
+def whisper_model(cfg: dict) -> str:
+    model = cfg.get("models", {}).get("whisper", "TBD")
+    if not model or model == "TBD":
+        die("config [models].whisper is unset — run the bake-off and set it")
+    return model
+
+
+def segment_rows(clip_id: str, gen: int, segments: list) -> list[tuple]:
+    hash_tail = clip_id.removeprefix("clip_")
+    rows = []
+    idx = 0
+    for s in segments:
+        text = s["text"].strip()
+        if not text:
+            continue
+        words = [{"w": w["word"], "t0": round(w["start"], 3), "t1": round(w["end"], 3)}
+                 for w in s.get("words", [])]
+        rows.append((f"seg_{hash_tail}_r{gen}_{idx:04d}", clip_id, gen, idx,
+                     round(s["start"], 3), round(s["end"], 3), text,
+                     json.dumps(words, ensure_ascii=False)))
+        idx += 1
+    return rows
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("clip_ids", nargs="*")
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    require_drive(cfg)
+    model = whisper_model(cfg)
+    conn = open_db(cfg, args.db)
+
+    if args.clip_ids:
+        clips = []
+        for cid in args.clip_ids:
+            row = conn.execute("SELECT * FROM clip WHERE id = ?", (cid,)).fetchone()
+            if row is None:
+                die(f"unknown clip id: {cid}")
+            clips.append(row)
+    else:
+        clips = conn.execute(
+            "SELECT * FROM clip WHERE is_canonical_audio = 1 "
+            "AND transcribed_at IS NULL ORDER BY capture_date").fetchall()
+        if args.limit:
+            clips = clips[: args.limit]
+
+    import mlx_whisper  # deferred: slow import, and --help shouldn't need it
+
+    report = {"model": model, "transcribed": [], "errors": []}
+    for clip in clips:
+        path = Path(clip["path"])
+        if not path.exists():
+            report["errors"].append({"clip_id": clip["id"],
+                                     "error": f"media missing: {path}"})
+            continue
+        t0 = time.time()
+        try:
+            result = mlx_whisper.transcribe(
+                str(path), path_or_hf_repo=model, word_timestamps=True)
+        except Exception as e:
+            report["errors"].append({"clip_id": clip["id"], "error": str(e)})
+            continue
+
+        gen = clip["transcribe_gen"] + 1
+        rows = segment_rows(clip["id"], gen, result["segments"])
+        conn.execute("BEGIN")
+        try:
+            conn.execute("DELETE FROM segment WHERE clip_id = ?", (clip["id"],))
+            conn.executemany(
+                "INSERT INTO segment (id, clip_id, gen, idx, t_in, t_out, text, words_json) "
+                "VALUES (?,?,?,?,?,?,?,?)", rows)
+            conn.execute(
+                "UPDATE clip SET transcribe_gen = ?, transcribed_at = ? WHERE id = ?",
+                (gen, datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                 clip["id"]))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+        report["transcribed"].append({
+            "clip_id": clip["id"], "gen": gen, "segments": len(rows),
+            "language": result["language"], "wall_s": round(time.time() - t0, 1)})
+        if not args.as_json:
+            r = report["transcribed"][-1]
+            print(f"{r['clip_id']} r{r['gen']}: {r['segments']} segments "
+                  f"({r['language']}, {r['wall_s']}s)", flush=True)
+
+    if args.as_json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(f"transcribed {len(report['transcribed'])} clip(s) with {model}")
+        for e in report["errors"]:
+            print(f"  ERROR {e['clip_id']}: {e['error']}")
+    sys.exit(1 if report["errors"] else 0)
+
+
+if __name__ == "__main__":
+    main()

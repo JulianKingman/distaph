@@ -1,0 +1,63 @@
+#!/bin/bash
+# Build Distaph.app next to this repo: a tiny launcher that opens Terminal
+# into the Distaph menu. Run it once after cloning (or after moving the folder):
+#
+#   /Applications/Distaph/macos/build-app
+#
+# The .app holds no code or data — it just runs bin/distaph from the folder it
+# sits in, so moving the whole folder keeps it working. It's gitignored and
+# safe to rebuild any time.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+APP="$ROOT/Distaph.app"
+ICON="$ROOT/assets/icon/distaph-icon-1024.png"
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+command -v uv >/dev/null || {
+  echo "Distaph needs uv (it runs the scripts and their dependencies)."
+  echo "Install it:  curl -LsSf https://astral.sh/uv/install.sh | sh"
+  exit 1
+}
+
+cat > "$WORK/launch.applescript" <<'APPLESCRIPT'
+on run
+	set appPath to POSIX path of (path to me)
+	set rootPath to do shell script "dirname " & quoted form of appPath
+	set cmd to "clear; " & quoted form of (rootPath & "/bin/distaph") & "; exit"
+	tell application "Terminal"
+		activate
+		do script cmd
+	end tell
+end run
+APPLESCRIPT
+
+rm -rf "$APP"
+osacompile -o "$APP" "$WORK/launch.applescript"
+
+ICONSET="$WORK/Distaph.iconset"
+mkdir "$ICONSET"
+for s in 16 32 128 256 512; do
+  sips -z "$s" "$s" "$ICON" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+  d=$((s * 2))
+  sips -z "$d" "$d" "$ICON" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/applet.icns"
+
+PLIST="$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleName Distaph" "$PLIST"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.distaph.launcher" "$PLIST" 2>/dev/null \
+  || /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.distaph.launcher" "$PLIST"
+touch "$APP"
+
+echo "Built $APP"
+
+# Put `distaph` on your PATH too, where that needs no sudo.
+for dir in /opt/homebrew/bin "$HOME/.local/bin"; do
+  if [ -d "$dir" ] && [ -w "$dir" ]; then
+    ln -sf "$ROOT/bin/distaph" "$dir/distaph"
+    echo "Linked $dir/distaph"
+    break
+  fi
+done

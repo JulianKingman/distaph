@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""build — resolve an ordered segment-ID list into FCPXML (or IntelliScript txt).
+
+Per specs/06-skill.md: the skill emits IDs; this script reconstructs the cut
+from the DB by resolving them. There is no channel for text to reach the
+timeline — an unknown ID is a hard error here even though `validate` should
+have caught it first (defense in depth, same fence).
+
+Contract from spike/FINDINGS.md: bare FCPXML 1.10 (not a bundle), rational
+times, absolute file:// archive paths (the only durable carrier through
+Resolve), source in/out expressed in each clip's native frame rate, no meaning
+encoded in names or resource IDs.
+
+Cut file format (JSON): {"name": "...", "segments": [entry, ...]} or a bare
+JSON array; each entry is a segment ID string or {"id": "seg_...",
+"pip": true}. `pip` superimposes the take-group sibling angle (DoubleTake
+records both cameras simultaneously, so the same source window is
+time-aligned) as a connected clip on lane 1, scaled into the top-right
+corner. `-` reads stdin.
+
+Usage: scripts/build CUT.json [--fcpxml OUT.fcpxml | --txt OUT.txt]
+                     [--config PATH] [--db PATH]
+"""
+
+import argparse
+import json
+import sys
+from pathlib import Path
+from urllib.parse import quote
+from xml.sax.saxutils import escape, quoteattr
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import die, load_config, open_db, require_drive
+
+NTSC = {23.976: (1001, 24000), 29.97: (1001, 30000), 59.94: (1001, 60000)}
+
+
+def frame_duration(fps: float) -> tuple[int, int]:
+    """(num, den) of one frame's duration for this rate."""
+    for ntsc, nd in NTSC.items():
+        if abs(fps - ntsc) < 0.01:
+            return nd
+    if abs(fps - round(fps)) > 0.01:
+        die(f"unsupported frame rate {fps}")
+    return (1, round(fps))
+
+
+def rational(t_seconds: float, fps: float) -> str:
+    """Snap a time to this rate's frame grid, as an FCPXML rational."""
+    num, den = frame_duration(fps)
+    frames = round(t_seconds * den / num)
+    return f"{frames * num}/{den}s"
+
+
+def load_cut(path: str) -> tuple[str, list[dict]]:
+    raw = sys.stdin.read() if path == "-" else Path(path).read_text()
+    data = json.loads(raw)
+    items = data if isinstance(data, list) else data["segments"]
+    name = "cut" if isinstance(data, list) else data.get("name", "cut")
+    entries = [i if isinstance(i, dict) else {"id": i} for i in items]
+    return name, entries
+
+
+def resolve(conn, entries: list[dict]) -> list[dict]:
+    rows = []
+    missing = []
+    for entry in entries:
+        row = conn.execute(
+            "SELECT s.id, s.t_in, s.t_out, s.text, c.id AS clip_id, c.path, "
+            "c.fps, c.width, c.height, c.source_name, c.duration_s, "
+            "c.take_group FROM segment s JOIN clip c ON c.id = s.clip_id "
+            "WHERE s.id = ?", (entry["id"],)).fetchone()
+        if row is None:
+            missing.append(entry["id"])
+            continue
+        s = dict(row)
+        s["pip_clip"] = None
+        if entry.get("pip"):
+            if not s["take_group"]:
+                die(f"{s['id']}: pip requested but clip {s['clip_id']} has no "
+                    "take-group sibling")
+            sib = conn.execute(
+                "SELECT id AS clip_id, path, fps, width, height, source_name, "
+                "duration_s FROM clip WHERE take_group = ? AND id != ?",
+                (s["take_group"], s["clip_id"])).fetchone()
+            if sib is None:
+                die(f"{s['id']}: pip requested but no sibling in take group "
+                    f"{s['take_group']}")
+            if s["t_out"] > sib["duration_s"] + 0.5:
+                die(f"{s['id']}: pip sibling {sib['clip_id']} is shorter than "
+                    f"the segment window ({sib['duration_s']}s < {s['t_out']}s)")
+            s["pip_clip"] = dict(sib)
+        rows.append(s)
+    if missing:
+        die(f"unknown segment id(s): {', '.join(missing)} — run validate; "
+            "hallucinated IDs never reach a timeline")
+    return rows
+
+
+def apply_padding(segs: list[dict], pad: float):
+    """Breathing room: widen each window by `pad`, clamped to the clip — but
+    never across the boundary of source-adjacent neighbors in the cut (padding
+    there would repeat audio instead of adding rhythm)."""
+    for i, s in enumerate(segs):
+        prev_s = segs[i - 1] if i > 0 else None
+        next_s = segs[i + 1] if i + 1 < len(segs) else None
+        lo = max(0.0, s["t_in"] - pad)
+        if (prev_s and prev_s["clip_id"] == s["clip_id"]
+                and s["t_in"] - prev_s["t_out"] < 2 * pad):
+            lo = s["t_in"]
+        hi = min(s["duration_s"], s["t_out"] + pad)
+        if (next_s and next_s["clip_id"] == s["clip_id"]
+                and next_s["t_in"] - s["t_out"] < 2 * pad):
+            hi = s["t_out"]
+        s["t_in"], s["t_out"] = lo, hi
+
+
+PIP_SCALE = 0.34
+# Copied verbatim from a Resolve-authored PiP export (the author's manual test).
+# Resolve's position units match no obvious canvas math — computed values have
+# rendered off-screen twice. Adjust EMPIRICALLY (small steps, re-import),
+# never by formula.
+PIP_POSITION = "16.6667 31.25"
+DEFAULT_PAD_S = 0.25  # breathing room around sentences (review feedback)
+
+
+def emit_fcpxml(name: str, segs: list[dict]) -> str:
+    seq_fps, seq_w, seq_h = segs[0]["fps"], segs[0]["width"], segs[0]["height"]
+    formats, fmt_ids = [], {}
+    assets, asset_ids = [], {}
+
+    def fmt_for(clip: dict) -> str:
+        key = (clip["fps"], clip["width"], clip["height"])
+        if key not in fmt_ids:
+            fmt_ids[key] = f"r{len(fmt_ids) + 1}"
+            num, den = frame_duration(clip["fps"])
+            formats.append(
+                f'<format id="{fmt_ids[key]}" frameDuration="{num}/{den}s" '
+                f'width="{clip["width"]}" height="{clip["height"]}"/>')
+        return fmt_ids[key]
+
+    def asset_for(clip: dict) -> str:
+        if clip["clip_id"] not in asset_ids:
+            asset_ids[clip["clip_id"]] = f"a{len(asset_ids) + 1}"
+            url = "file://" + quote(clip["path"])  # file:///Volumes/... (spike form)
+            assets.append(
+                f'<asset id="{asset_ids[clip["clip_id"]]}" '
+                f'name={quoteattr(clip["source_name"] or clip["clip_id"])} start="0s" '
+                f'duration="{rational(clip["duration_s"], clip["fps"])}" '
+                f'hasVideo="1" hasAudio="1" format="{fmt_for(clip)}">\n'
+                f'      <media-rep kind="original-media" src={quoteattr(url)}/>\n'
+                f'    </asset>')
+        return asset_ids[clip["clip_id"]]
+
+    spine, offset_frames = [], 0
+    seq_num, seq_den = frame_duration(seq_fps)
+    for s in segs:
+        dur_frames = round((s["t_out"] - s["t_in"]) * seq_den / seq_num)
+        attrs = (f'ref="{asset_for(s)}" name={quoteattr(s["id"])} '
+                 f'offset="{offset_frames * seq_num}/{seq_den}s" '
+                 f'start="{rational(s["t_in"], s["fps"])}" '
+                 f'duration="{dur_frames * seq_num}/{seq_den}s" '
+                 f'format="{fmt_for(s)}"')
+        if s["pip_clip"] is None:
+            spine.append(f"<asset-clip {attrs}/>")
+        else:
+            pip = s["pip_clip"]
+            # Same wall-clock window from the simultaneously-recorded sibling:
+            # the connected clip's offset lives in the parent's source time, so
+            # parent start == child offset aligns the two takes.
+            spine.append(
+                f"<asset-clip {attrs}>\n"
+                f'              <asset-clip ref="{asset_for(pip)}" lane="1" '
+                f'name={quoteattr(s["id"] + "_pip")} '
+                f'offset="{rational(s["t_in"], s["fps"])}" '
+                f'start="{rational(s["t_in"], pip["fps"])}" '
+                f'duration="{dur_frames * seq_num}/{seq_den}s" '
+                f'format="{fmt_for(pip)}">\n'
+                f'                <adjust-conform type="fit"/>\n'
+                f'                <adjust-transform position="{PIP_POSITION}" '
+                f'scale="{PIP_SCALE} {PIP_SCALE}" anchor="0 0"/>\n'
+                f"              </asset-clip>\n"
+                f"            </asset-clip>")
+        offset_frames += dur_frames
+    seq_fmt = fmt_ids[(seq_fps, seq_w, seq_h)]
+    total = f"{offset_frames * seq_num}/{seq_den}s"
+    nl = "\n    "
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.10">
+  <resources>
+    {nl.join(formats)}
+    {nl.join(assets)}
+  </resources>
+  <library>
+    <event name={quoteattr(name)}>
+      <project name={quoteattr(name)}>
+        <sequence format="{seq_fmt}" tcStart="0s" duration="{total}">
+          <spine>
+            {(nl + "        ").join(spine)}
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>
+"""
+
+
+def emit_txt(segs: list[dict]) -> str:
+    """IntelliScript input: the resolved transcript, verbatim from the DB."""
+    return "\n".join(s["text"] for s in segs) + "\n"
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("cut", help="cut JSON file, or - for stdin")
+    ap.add_argument("--fcpxml", help="output path for FCPXML")
+    ap.add_argument("--txt", help="output path for IntelliScript text")
+    ap.add_argument("--pad", type=float, default=DEFAULT_PAD_S,
+                    help=f"seconds of breathing room around each segment "
+                         f"(default {DEFAULT_PAD_S}; 0 disables)")
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--json", action="store_true",
+                    help="accepted for CLI consistency; output is plain text")
+    args = ap.parse_args()
+    if not args.fcpxml and not args.txt:
+        die("choose an output: --fcpxml OUT and/or --txt OUT")
+
+    cfg = load_config(args.config)
+    require_drive(cfg)
+    conn = open_db(cfg, args.db)
+
+    name, seg_ids = load_cut(args.cut)
+    if not seg_ids:
+        die("cut contains no segment ids")
+    segs = resolve(conn, seg_ids)
+    if args.pad:
+        apply_padding(segs, args.pad)
+
+    if args.fcpxml:
+        Path(args.fcpxml).write_text(emit_fcpxml(name, segs))
+        print(f"wrote {args.fcpxml}: {len(segs)} segments, "
+              f"{len({s['clip_id'] for s in segs})} clips")
+    if args.txt:
+        Path(args.txt).write_text(emit_txt(segs))
+        print(f"wrote {args.txt}")
+
+
+if __name__ == "__main__":
+    main()

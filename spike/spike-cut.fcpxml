@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE fcpxml>
+<fcpxml version="1.10">
+  <resources>
+    <format id="r1" name="spike_portrait_24" frameDuration="1/24s" width="1080" height="1920"/>
+    <format id="r2" name="spike_landscape_2997" frameDuration="1001/30000s" width="1920" height="1080"/>
+    <asset id="a1" name="clip-a" start="0s" duration="12625/600s" hasVideo="1" hasAudio="1" format="r1">
+      <media-rep kind="original-media" src="file:///Volumes/ARCHIVE/footage/clip-a.mov"/>
+    </asset>
+    <asset id="a2" name="clip-b" start="0s" duration="3373/10s" hasVideo="1" hasAudio="1" format="r2">
+      <media-rep kind="original-media" src="file:///Volumes/ARCHIVE/footage/clip-b.mov"/>
+    </asset>
+  </resources>
+  <library>
+    <event name="video-archive spike">
+      <project name="spike-cut">
+        <sequence format="r1" tcStart="0s" duration="480/24s">
+          <spine>
+            <asset-clip ref="a1" name="doubletake excerpt" offset="0s" start="120/24s" duration="240/24s"/>
+            <asset-clip ref="a2" name="iphone excerpt" offset="240/24s" start="900900/30000s" duration="240/24s"/>
+          </spine>
+        </sequence>
+      </project>
+    </event>
+  </library>
+</fcpxml>

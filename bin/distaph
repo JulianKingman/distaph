@@ -1,0 +1,566 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# dependencies = ["textual>=0.80"]
+# ///
+"""distaph — the front door.
+
+  distaph                 open the launcher (menu of everything Distaph does)
+  distaph init [PATH]     create a library (default ~/Distaph) and remember it
+  distaph where           print the library folder in use
+  distaph claude [TEXT]   open Claude Code in your library, with the Distaph skill
+  distaph <command> ...   run a script: sync, apply-review, search, build,
+                          validate, ingest, transcribe, caption, embed,
+                          export-facts, import-facts
+
+The launcher is deliberately thin (specs/08-library-and-launcher.md): it shows
+what you can do, in workflow order, and collects the few inputs each action
+needs by browsing your library. Plumbing actions run the scripts directly.
+Judgment actions (cuts, narratives, ideas) hand off to Claude Code with the
+context already written, then bring you back here when you're done.
+"""
+
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+APP_ROOT = Path(__file__).resolve().parent.parent
+SCRIPTS = APP_ROOT / "scripts"
+TEMPLATE = APP_ROOT / "templates" / "library"
+sys.path.insert(0, str(SCRIPTS))
+import common  # noqa: E402  (library resolution lives in one place)
+
+SCRIPT_COMMANDS = sorted(p.name for p in SCRIPTS.iterdir()
+                         if p.is_file() and p.suffix == "" and os.access(p, os.X_OK))
+
+
+# ---------------------------------------------------------------- environment
+
+def child_env(library: Path) -> dict:
+    env = dict(os.environ)
+    env["DISTAPH_LIBRARY"] = str(library)
+    env["DISTAPH_HOME"] = str(APP_ROOT)
+    env["PATH"] = f"{APP_ROOT / 'bin'}{os.pathsep}{env.get('PATH', '')}"
+    return env
+
+
+def link_skill(library: Path) -> None:
+    """Keep <library>/.claude/skills/distaph pointing at this install's skill.
+    Recreated on every launch, and gitignored, so the library never stores a
+    path that only exists on one machine."""
+    target = APP_ROOT / "skill"
+    link = library / ".claude" / "skills" / "distaph"
+    link.parent.mkdir(parents=True, exist_ok=True)
+    if link.is_symlink() and Path(os.readlink(link)) == target:
+        return
+    if link.is_symlink() or link.exists():
+        if link.is_dir() and not link.is_symlink():
+            return  # someone vendored a copy on purpose; leave it alone
+        link.unlink()
+    link.symlink_to(target)
+
+
+def run_script(name: str, args: list[str]) -> int:
+    library = common.library_root()
+    return subprocess.call([str(SCRIPTS / name), *args], env=child_env(library))
+
+
+def open_claude(library: Path, prompt: str | None) -> int:
+    claude = shutil.which("claude")
+    if not claude:
+        print("Claude Code isn't installed. Get it at https://claude.com/claude-code "
+              "and run `distaph` again.", file=sys.stderr)
+        return 1
+    link_skill(library)
+    cmd = [claude] + ([prompt] if prompt else [])
+    return subprocess.call(cmd, cwd=library, env=child_env(library))
+
+
+# ----------------------------------------------------------------------- init
+
+def init(path: Path) -> int:
+    path = path.expanduser().resolve()
+    if (path / common.CONFIG_NAME).exists():
+        print(f"{path} is already a Distaph library.")
+    else:
+        path.mkdir(parents=True, exist_ok=True)
+        for src in TEMPLATE.rglob("*"):
+            rel = src.relative_to(TEMPLATE)
+            dst = path / rel
+            if src.is_dir():
+                dst.mkdir(parents=True, exist_ok=True)
+            elif not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+        tmpl = path / "distaph.toml.template"
+        if tmpl.exists():
+            tmpl.rename(path / common.CONFIG_NAME)
+        print(f"Created a library at {path}")
+        print(f"Edit {path / common.CONFIG_NAME} to point at your footage drive.")
+    if not (path / ".git").exists() and shutil.which("git"):
+        subprocess.run(["git", "init", "-q", "-b", "main", str(path)])
+        subprocess.run(["git", "-C", str(path), "add", "-A"])
+        subprocess.run(["git", "-C", str(path), "commit", "-q", "-m",
+                        "New Distaph library"], capture_output=True)
+        print("Put it under git. Distaph commits after every sync and review; "
+              "it never pushes. If you add a remote, make it private.")
+    common.LIBRARY_POINTER.parent.mkdir(parents=True, exist_ok=True)
+    common.LIBRARY_POINTER.write_text(str(path) + "\n")
+    link_skill(path)
+    print(f"Distaph will use this library from now on ({common.LIBRARY_POINTER}).")
+    return 0
+
+
+# --------------------------------------------------------------------- status
+
+def library_status(library: Path) -> dict:
+    s = {"library": library, "ok": (library / common.CONFIG_NAME).exists()}
+    if not s["ok"]:
+        return s
+    try:
+        cfg = common.load_config()
+    except SystemExit:
+        s["ok"] = False
+        return s
+    s["cfg"] = cfg
+    drive = Path(cfg["media"]["drive"])
+    s["drive"] = drive
+    s["mounted"] = os.path.ismount(drive)
+    intake = Path(cfg["media"]["intake"])
+    s["intake_waiting"] = (sum(1 for p in intake.iterdir()
+                               if p.is_file() and not p.name.startswith("."))
+                           if s["mounted"] and intake.is_dir() else None)
+    db = common.resolve_path(cfg, cfg["db"]["path"])
+    s["clips"] = s["segments"] = 0
+    if db.exists():
+        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            s["clips"] = c.execute("SELECT count(*) FROM clip").fetchone()[0]
+            s["segments"] = c.execute("SELECT count(*) FROM segment").fetchone()[0]
+        except sqlite3.Error:
+            pass
+        c.close()
+    vault = common.vault_path(cfg)
+    s["vault"] = vault
+    review = vault / "review"
+    s["open_notes"] = sorted(
+        (p for p in review.glob("*.md")
+         if p.name != "resolved-dupes.md" and "status: open" in p.read_text()),
+        reverse=True) if review.is_dir() else []
+    s["narratives"] = sorted((vault / "narratives").glob("*.md"))
+    s["projects"] = sorted(p.relative_to(vault / "projects").with_suffix("").as_posix()
+                           for p in (vault / "projects").rglob("*.md"))
+    return s
+
+
+# ------------------------------------------------------------------------ TUI
+
+def tui() -> int:
+    from textual import on, work
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Horizontal, Vertical
+    from textual.screen import ModalScreen
+    from textual.widgets import (Footer, Header, Input, Label, ListItem, ListView,
+                                 OptionList, RichLog, Static)
+    from textual.widgets.option_list import Option
+
+    library = common.library_root()
+
+    # (key, id, title, hint, kind) — kind: run | open | ask | claude | section
+    ACTIONS = [
+        ("", "", "EVERY DAY", "", "section"),
+        ("s", "sync", "Sync new footage",
+         "Catalog everything in your intake folder: hash, date, transcribe, caption, embed.", "run"),
+        ("r", "review", "Review in Obsidian",
+         "Open the latest review note. Tick the proposals you agree with.", "open"),
+        ("a", "apply", "Apply review",
+         "Apply what you ticked. Unticked lines wait for next time.", "run"),
+        ("f", "find", "Find footage",
+         "Search what was said or shown, across every clip you own.", "ask"),
+        ("", "", "MAKE SOMETHING", "", "section"),
+        ("c", "cut", "Make a cut…",
+         "Describe a video. Claude picks real lines and builds a Resolve timeline.", "claude"),
+        ("n", "narrative", "Work on a narrative…",
+         "Grow a story thread that spans clips and years.", "claude"),
+        ("i", "ideas", "Suggest ideas",
+         "Ask what's worth making next from what you already have. (early)", "claude"),
+        ("t", "talk", "Talk to Claude",
+         "Open Claude Code in your library with the Distaph skill loaded.", "claude"),
+        ("", "", "LIBRARY", "", "section"),
+        ("o", "folder", "Open library folder", "Show your library in Finder.", "open"),
+    ]
+
+    class Ask(ModalScreen[str | None]):
+        """One text question. Esc cancels."""
+        BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+        def __init__(self, title: str, placeholder: str = ""):
+            super().__init__()
+            self.title_text, self.placeholder = title, placeholder
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="dialog"):
+                yield Label(self.title_text, id="dialog-title")
+                yield Input(placeholder=self.placeholder, id="dialog-input")
+                yield Label("Enter to continue · Esc to cancel", classes="muted")
+
+        @on(Input.Submitted)
+        def done(self, e: Input.Submitted) -> None:
+            self.dismiss(e.value.strip() or None)
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+    class Pick(ModalScreen[str | None]):
+        """Pick one of a list (read from the library, so nothing to remember)."""
+        BINDINGS = [Binding("escape", "cancel", "Cancel")]
+
+        def __init__(self, title: str, options: list[tuple[str, str]]):
+            super().__init__()
+            self.title_text, self.options = title, options
+
+        def compose(self) -> ComposeResult:
+            with Vertical(id="dialog"):
+                yield Label(self.title_text, id="dialog-title")
+                yield OptionList(*[Option(label, id=value) for value, label in self.options],
+                                 id="dialog-options")
+                yield Label("Enter to choose · Esc to cancel", classes="muted")
+
+        @on(OptionList.OptionSelected)
+        def done(self, e: OptionList.OptionSelected) -> None:
+            self.dismiss(e.option.id)
+
+        def action_cancel(self) -> None:
+            self.dismiss(None)
+
+    class Launcher(App):
+        TITLE = "Distaph"
+        CSS = """
+        Screen { background: #0d1530; }
+        Header { background: #0d1530; color: #e9e2d0; }
+        #status { height: auto; padding: 1 2; color: #e9e2d0; background: #121c3d; }
+        #body { height: 1fr; }
+        #menu { width: 34; height: 1fr; border-right: solid #2a3766; background: #0d1530; }
+        #menu > ListItem { padding: 0 1; background: #0d1530; }
+        #menu > ListItem.--highlight { background: #2a3766; }
+        .section { color: #c9a35b; text-style: bold; padding-top: 1; }
+        .key { color: #c9a35b; text-style: bold; }
+        .muted { color: #8b93b0; }
+        #right { padding: 0 1; }
+        #hint { height: auto; padding: 1 1; color: #c9cfe3; }
+        #log { height: 1fr; background: #0a1026; border: round #2a3766; }
+        #dialog { width: 72; height: auto; max-height: 80%; padding: 1 2;
+                  background: #121c3d; border: round #c9a35b; }
+        #dialog-title { text-style: bold; color: #e9e2d0; padding-bottom: 1; }
+        #dialog-options { height: auto; max-height: 20; }
+        Ask, Pick { align: center middle; }
+        """
+        BINDINGS = [Binding(k, f"act('{i}')", t, show=False)
+                    for k, i, t, _, kind in ACTIONS if kind != "section"] + [
+                    Binding("q", "quit", "Quit")]
+
+        handoff: str | None = None   # a prompt ("" = plain session) for Claude Code
+        busy = False
+
+        def compose(self) -> ComposeResult:
+            yield Header()
+            yield Static(id="status")
+            with Horizontal(id="body"):
+                items = []
+                for key, ident, title, _, kind in ACTIONS:
+                    if kind == "section":
+                        items.append(ListItem(Label(title, classes="section"),
+                                              disabled=True))
+                    else:
+                        items.append(ListItem(Label(f"[b #c9a35b]{key}[/]  {title}"),
+                                              id=f"act-{ident}"))
+                yield ListView(*items, id="menu")
+                with Vertical(id="right"):
+                    yield Static(id="hint")
+                    yield RichLog(id="log", wrap=True, markup=True)
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self.sub_title = str(library)
+            self.refresh_status()
+            menu = self.query_one("#menu", ListView)
+            menu.index = 1
+            menu.focus()
+            log = self.query_one("#log", RichLog)
+            st = self.status_
+            if not st["ok"]:
+                log.write("[b]No library yet.[/] Quit (q) and run "
+                          "[b]distaph init[/] in Terminal, then open Distaph again.")
+            elif not st["mounted"]:
+                log.write(f"[#e07a5f]Your footage drive isn't mounted[/] "
+                          f"({st['drive']}). Plug it in before syncing or searching.")
+            elif st["open_notes"]:
+                log.write("A review note is waiting — press r to open it.")
+            elif st["intake_waiting"]:
+                log.write(f"{st['intake_waiting']} new file(s) in intake — "
+                          f"press s to sync.")
+            else:
+                log.write("All caught up. Make something?")
+
+        def refresh_status(self) -> None:
+            self.status_ = st = library_status(library)
+            if not st["ok"]:
+                text = "[b]Library[/]  not set up"
+            else:
+                drive = ("[#7ec699]mounted[/]" if st["mounted"]
+                         else "[#e07a5f]not mounted[/]")
+                waiting = st["intake_waiting"]
+                notes = len(st["open_notes"])
+                text = (f"[b]Drive[/] {drive}    "
+                        f"[b]Intake[/] {'—' if waiting is None else waiting} waiting    "
+                        f"[b]Clips[/] {st['clips']}    [b]Lines[/] {st['segments']}    "
+                        f"[b]Narratives[/] {len(st['narratives'])}    "
+                        f"[b]Review[/] {'[#c9a35b]' + str(notes) + ' open[/]' if notes else 'clear'}")
+            self.query_one("#status", Static).update(text)
+
+        @on(ListView.Highlighted)
+        def show_hint(self, e: ListView.Highlighted) -> None:
+            if e.item is None or not e.item.id:
+                return
+            ident = e.item.id.removeprefix("act-")
+            for _, i, title, hint, kind in ACTIONS:
+                if i == ident:
+                    tag = {"claude": "  [#8b93b0](opens Claude Code)[/]"}.get(kind, "")
+                    self.query_one("#hint", Static).update(f"[b]{title}[/]{tag}\n{hint}")
+
+        @on(ListView.Selected)
+        def choose(self, e: ListView.Selected) -> None:
+            if e.item.id:
+                self.action_act(e.item.id.removeprefix("act-"))
+
+        # ---------------------------------------------------------- actions
+
+        def say(self, msg: str) -> None:
+            self.query_one("#log", RichLog).write(msg)
+
+        def need_library(self) -> bool:
+            if not self.status_["ok"]:
+                self.say("Set up a library first: [b]distaph init[/] in Terminal.")
+                return False
+            return True
+
+        def need_drive(self) -> bool:
+            if not self.need_library():
+                return False
+            if not self.status_["mounted"]:
+                self.say(f"[#e07a5f]Plug in your footage drive[/] ({self.status_['drive']}) first.")
+                return False
+            return True
+
+        def action_act(self, ident: str) -> None:
+            if self.busy:
+                self.say("Still working on the last thing — hang on.")
+                return
+            getattr(self, f"do_{ident}")()
+
+        def do_sync(self) -> None:
+            if self.need_drive():
+                self.stream("Syncing", ["sync"])
+
+        def do_apply(self) -> None:
+            if not self.need_drive():
+                return
+            notes = self.status_["open_notes"]
+            if not notes:
+                self.say("No open review note. Sync first, then review.")
+                return
+            self.stream("Applying review", ["apply-review", str(notes[0])])
+
+        def do_review(self) -> None:
+            if not self.need_library():
+                return
+            notes = self.status_["open_notes"]
+            if not notes:
+                self.say("Nothing to review right now.")
+                return
+            note = notes[0]
+            vault = self.status_["vault"]
+            rel = note.relative_to(vault).as_posix()
+            from urllib.parse import quote
+            url = f"obsidian://open?vault={quote(vault.name)}&file={quote(rel)}"
+            if subprocess.call(["open", url], stderr=subprocess.DEVNULL) != 0:
+                subprocess.call(["open", str(note)])
+            self.say(f"Opened [b]{rel}[/]. Tick what you agree with, then press [b]a[/].")
+
+        def do_folder(self) -> None:
+            subprocess.call(["open", str(library)])
+
+        def do_find(self) -> None:
+            if not self.need_drive():
+                return
+
+            def go(query: str | None) -> None:
+                if query:
+                    self.stream(f"Searching for “{query}”", ["search", query, "--k", "15"],
+                                pretty_search=True)
+            self.push_screen(Ask("What are you looking for?",
+                                 "e.g. first time the projector worked"), go)
+
+        def do_cut(self) -> None:
+            if not self.need_drive():
+                return
+            st = self.status_
+            options = [("free", "Describe it in my own words")]
+            options += [(f"nar:{p.stem}", f"From narrative: {p.stem}") for p in st["narratives"]]
+            options += [(f"proj:{p}", f"From project: {p}") for p in st["projects"]]
+
+            def scoped(choice: str | None) -> None:
+                if not choice:
+                    return
+                scope = ""
+                if choice.startswith("nar:"):
+                    scope = (f" Draw on the narrative vault/narratives/{choice[4:]}.md "
+                             f"(its thread order is my intent unless I say otherwise).")
+                elif choice.startswith("proj:"):
+                    scope = f" Scope the search to project `{choice[5:]}`."
+
+                def described(text: str | None) -> None:
+                    if text:
+                        self.hand_off(
+                            f"Use the distaph skill to make a cut: {text}.{scope} "
+                            f"Follow the cut operation exactly — search, choose and order real "
+                            f"segment IDs, validate, then build an FCPXML into the library's "
+                            f"cuts/ folder. Tell me what's in it, what you left out, and the "
+                            f"file path so I can import it into Resolve.")
+                self.push_screen(Ask("What should this video be?",
+                                     "e.g. a 3-minute story of building the projector, "
+                                     "upbeat ending"), described)
+            self.push_screen(Pick("Where should the material come from?", options), scoped)
+
+        def do_narrative(self) -> None:
+            if not self.need_library():
+                return
+            options = [("new", "Start a new narrative")]
+            options += [(p.stem, p.stem) for p in self.status_["narratives"]]
+
+            def picked(choice: str | None) -> None:
+                if not choice:
+                    return
+                if choice == "new":
+                    def described(text: str | None) -> None:
+                        if text:
+                            self.hand_off(
+                                f"Use the distaph skill (narrate operation). Start a new "
+                                f"narrative about: {text}. Search for real material, propose "
+                                f"an ordered thread of segment IDs with echoes, mark gaps as "
+                                f"NEEDED entries, validate it, and show me before writing.")
+                    self.push_screen(Ask("What's the story about?",
+                                         "e.g. learning to build with light"), described)
+                else:
+                    def described(text: str | None) -> None:
+                        self.hand_off(
+                            f"Use the distaph skill (narrate operation). Let's work on "
+                            f"vault/narratives/{choice}.md. "
+                            + (f"Specifically: {text}. " if text else
+                               "Read it, tell me where it stands and what's missing. ")
+                            + "Never touch my prose outside the auto-summary section.")
+                    self.push_screen(Ask(f"What do you want to do with “{choice}”?",
+                                         "leave blank to get a status read"), described)
+            self.push_screen(Pick("Which narrative?", options), picked)
+
+        def do_ideas(self) -> None:
+            if not self.need_library():
+                return
+            self.hand_off(
+                "Use the distaph skill. Suggest a few videos worth making next from what's "
+                "already in this library: read the narratives and project notes, search for "
+                "strong material, and for each idea give a one-line pitch, the real clip or "
+                "segment IDs it would draw on, and what's missing (lines to record, B-roll). "
+                "The summary layer doesn't exist yet, so say where you're working from "
+                "search alone.")
+
+        def do_talk(self) -> None:
+            if self.need_library():
+                self.hand_off("")
+
+        def hand_off(self, prompt: str) -> None:
+            self.handoff = prompt
+            self.exit()
+
+        def stream(self, label: str, argv: list[str], pretty_search: bool = False) -> None:
+            self.busy = True
+            self.say(f"\n[b #c9a35b]{label}…[/]")
+            self.run_cmd(argv, pretty_search)
+
+        @work(thread=True, exclusive=True)
+        def run_cmd(self, argv: list[str], pretty_search: bool) -> None:
+            proc = subprocess.Popen([str(SCRIPTS / argv[0]), *argv[1:]],
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                    text=True, env=child_env(library))
+            out = []
+            for line in proc.stdout:
+                out.append(line)
+                if not pretty_search:
+                    self.call_from_thread(self.say, line.rstrip())
+            code = proc.wait()
+            if pretty_search and code == 0:
+                self.call_from_thread(self.show_search, "".join(out))
+            elif pretty_search:
+                self.call_from_thread(self.say, "".join(out)[-1500:])
+            self.call_from_thread(self.finish, code)
+
+        def show_search(self, raw: str) -> None:
+            import json
+            try:
+                data = json.loads(raw[raw.index("{"):])
+            except ValueError:
+                self.say(raw[-1500:])
+                return
+            if not data["results"]:
+                self.say("Nothing matched.")
+            for r in data["results"]:
+                text = r.get("text") or r.get("caption") or r.get("visual_summary") or ""
+                when = r.get("t_in", r.get("t"))
+                at = f" @ {when:.0f}s" if isinstance(when, (int, float)) else ""
+                self.say(f"[#8b93b0]{r['score']:.2f}[/]  {text.strip()[:140]}\n"
+                         f"      [#8b93b0]{r.get('id', '')}{at}[/]")
+
+        def finish(self, code: int) -> None:
+            self.busy = False
+            self.say("[#7ec699]Done.[/]" if code == 0 else f"[#e07a5f]Stopped (exit {code}).[/]")
+            self.refresh_status()
+
+    while True:
+        app = Launcher()
+        app.run()
+        if app.handoff is None:
+            return 0
+        open_claude(library, app.handoff or None)
+        # Back to the menu when Claude Code exits — state may have changed.
+
+
+# ----------------------------------------------------------------------- main
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        return tui()
+    cmd, rest = args[0], args[1:]
+    if cmd in ("-h", "--help", "help"):
+        print(__doc__)
+        return 0
+    if cmd == "init":
+        return init(Path(rest[0]) if rest else Path("~/Distaph"))
+    if cmd == "where":
+        print(common.library_root())
+        return 0
+    if cmd == "claude":
+        return open_claude(common.library_root(), " ".join(rest) or None)
+    if cmd in SCRIPT_COMMANDS:
+        return run_script(cmd, rest)
+    print(f"unknown command: {cmd}\n", file=sys.stderr)
+    print(__doc__, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

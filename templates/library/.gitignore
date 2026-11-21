@@ -1,0 +1,19 @@
+# The database is a build artifact: facts/ holds the expensive parts as text,
+# and embeddings rebuild with `distaph embed`.
+db/
+*.sqlite
+*.sqlite-*
+
+# Timelines are rebuilt from cuts/*.json with `distaph build`.
+cuts/*.fcpxml
+cuts/*.fcpxmld/
+cuts/*.txt
+
+# Points at your Distaph install; the launcher recreates it.
+.claude/skills/distaph
+
+# Obsidian per-device UI state.
+vault/.obsidian/workspace*
+vault/.obsidian/cache
+
+.DS_Store
