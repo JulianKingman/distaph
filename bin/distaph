@@ -114,6 +114,171 @@ def init(path: Path) -> int:
     return 0
 
 
+# ----------------------------------------------------------------------- jobs
+#
+# Long jobs (sync, apply-review) run detached, writing to a log file in the
+# library, so they keep going if the launcher closes and can be picked up again
+# when it reopens. Only one of them runs at a time: both write the database and
+# commit the library. Everything else in the launcher runs alongside them.
+
+WRITER_JOBS = ("sync", "apply-review")
+
+
+def jobs_dir(library: Path) -> Path:
+    d = library / ".distaph" / "jobs"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def start_job(library: Path, name: str, args: list[str]) -> dict:
+    d = jobs_dir(library)
+    log = d / f"{name}.log"
+    with open(log, "w") as out:
+        proc = subprocess.Popen([str(SCRIPTS / name), *args], stdout=out,
+                                stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                env=child_env(library), start_new_session=True)
+    (d / f"{name}.pid").write_text(str(proc.pid))
+    return {"name": name, "pid": proc.pid, "proc": proc, "log": log, "offset": 0}
+
+
+def running_jobs(library: Path) -> list[dict]:
+    """Jobs still running from an earlier launcher session."""
+    found = []
+    for pid_file in sorted(jobs_dir(library).glob("*.pid")):
+        try:
+            pid = int(pid_file.read_text().strip())
+        except ValueError:
+            pid = 0
+        if pid and pid_alive(pid):
+            found.append({"name": pid_file.stem, "pid": pid, "proc": None,
+                          "log": pid_file.with_suffix(".log"), "offset": 0})
+        else:
+            pid_file.unlink(missing_ok=True)
+    return found
+
+
+# ------------------------------------------------------------ terminal windows
+
+def open_in_terminal(lines: list[str]) -> None:
+    """Run commands in a new window of your default terminal app, via a
+    one-shot .command file (no Automation permission needed)."""
+    import tempfile
+    import uuid
+    script = Path(tempfile.gettempdir()) / f"distaph-{uuid.uuid4().hex}.command"
+    script.write_text("#!/bin/zsh -il\nrm -f -- \"$0\"\n" + "\n".join(lines) + "\n")
+    script.chmod(0o700)
+    subprocess.Popen(["open", str(script)])
+
+
+def sh_quote(s: str) -> str:
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def open_claude_window(library: Path, prompt: str | None) -> None:
+    """Claude Code in a new terminal window, in the library, with the skill
+    linked. The launcher stays open alongside it."""
+    import tempfile
+    link_skill(library)
+    lines = [
+        f"cd {sh_quote(str(library))} || exit 1",
+        f"export DISTAPH_LIBRARY={sh_quote(str(library))}",
+        f"export DISTAPH_HOME={sh_quote(str(APP_ROOT))}",
+        f"export PATH={sh_quote(str(APP_ROOT / 'bin'))}:$PATH",
+        "if ! command -v claude >/dev/null; then",
+        "  echo 'Claude Code is not installed. Get it at https://claude.com/claude-code'",
+        "  read -k1 '?Press any key to close.'; exit 1",
+        "fi",
+    ]
+    if prompt:
+        f = tempfile.NamedTemporaryFile("w", suffix=".txt", prefix="distaph-prompt-",
+                                        delete=False)
+        f.write(prompt)
+        f.close()
+        lines += [f"p=\"$(cat {sh_quote(f.name)})\"; rm -f {sh_quote(f.name)}",
+                  'exec claude "$p"']
+    else:
+        lines.append("exec claude")
+    open_in_terminal(lines)
+
+
+# ------------------------------------------------------------------- settings
+
+SETTINGS_FIELDS = [
+    ("media", "drive", "Footage drive", "The drive your footage lives on."),
+    ("media", "intake", "Intake folder", "Drop new footage here; sync empties it."),
+    ("media", "archive", "Archive folder", "Where Distaph files footage by content hash."),
+    ("models", "whisper", "Transcription model", "Whisper, run locally with MLX."),
+    ("models", "vlm", "Caption model", "A vision model that describes keyframes, run locally."),
+    ("models", "embedder", "Search model", "Turns lines and captions into searchable vectors, locally."),
+]
+
+
+def set_toml_value(text: str, section: str, key: str, value: str) -> str:
+    """Replace `key = "..."` inside [section], keeping any trailing comment."""
+    import json
+    import re
+    out, current, done = [], None, False
+    for line in text.splitlines(keepends=True):
+        m = re.match(r"\s*\[([^\]]+)\]", line)
+        if m:
+            if current == section and not done:
+                out.append(f"{key} = {json.dumps(value)}\n")
+                done = True
+            current = m.group(1).strip()
+        elif current == section and not done:
+            m = re.match(r'(\s*' + re.escape(key) + r'\s*=\s*)("(?:[^"\\]|\\.)*"|[^#\n]*?)(\s*(#.*)?)$',
+                         line.rstrip("\n"))
+            if m:
+                line = m.group(1) + json.dumps(value) + (m.group(3) or "") + "\n"
+                done = True
+        out.append(line)
+    if not done:
+        if current != section:
+            out.append(f"\n[{section}]\n")
+        out.append(f"{key} = {json.dumps(value)}\n")
+    return "".join(out)
+
+
+def model_downloaded(repo: str) -> bool:
+    hub = Path(os.environ.get("HF_HOME", "~/.cache/huggingface")).expanduser() / "hub"
+    return (hub / ("models--" + repo.replace("/", "--"))).is_dir()
+
+
+# ---------------------------------------------------------------------- drive
+
+def drive_state(drive: Path) -> tuple[str, str | None]:
+    """Where the footage drive is: ("mounted", None), ("attached", device) when
+    it's plugged in but not mounted (e.g. after an eject without unplugging),
+    or ("absent", None). The drive is matched by its volume name — the last
+    part of [media].drive, e.g. "Photos" for /Volumes/Photos."""
+    if os.path.ismount(drive):
+        return "mounted", None
+    if not shutil.which("diskutil"):
+        return "absent", None
+    import plistlib
+    try:
+        out = subprocess.run(["diskutil", "list", "-plist"], capture_output=True,
+                             timeout=10).stdout
+        disks = plistlib.loads(out).get("AllDisksAndPartitions", [])
+    except Exception:
+        return "absent", None
+    for disk in disks:
+        for vol in [disk, *disk.get("Partitions", []), *disk.get("APFSVolumes", [])]:
+            if vol.get("VolumeName") == drive.name and not vol.get("MountPoint"):
+                return "attached", vol.get("DeviceIdentifier")
+    return "absent", None
+
+
 # --------------------------------------------------------------------- status
 
 def library_status(library: Path) -> dict:
@@ -128,7 +293,8 @@ def library_status(library: Path) -> dict:
     s["cfg"] = cfg
     drive = Path(cfg["media"]["drive"])
     s["drive"] = drive
-    s["mounted"] = os.path.ismount(drive)
+    s["drive_state"], s["drive_device"] = drive_state(drive)
+    s["mounted"] = s["drive_state"] == "mounted"
     intake = Path(cfg["media"]["intake"])
     s["intake_waiting"] = (sum(1 for p in intake.iterdir()
                                if p.is_file() and not p.name.startswith("."))
@@ -162,9 +328,9 @@ def tui() -> int:
     from textual import on, work
     from textual.app import App, ComposeResult
     from textual.binding import Binding
-    from textual.containers import Horizontal, Vertical
+    from textual.containers import Horizontal, Vertical, VerticalScroll
     from textual.screen import ModalScreen
-    from textual.widgets import (Footer, Header, Input, Label, ListItem, ListView,
+    from textual.widgets import (Button, Footer, Header, Input, Label, ListItem, ListView,
                                  OptionList, RichLog, Static)
     from textual.widgets.option_list import Option
 
@@ -191,7 +357,11 @@ def tui() -> int:
         ("t", "talk", "Talk to Claude",
          "Open Claude Code in your library with the Distaph skill loaded.", "claude"),
         ("", "", "LIBRARY", "", "section"),
+        ("d", "drive", "Drive…", "Mount your footage drive, or eject it safely.", "run"),
         ("o", "folder", "Open library folder", "Show your library in Finder.", "open"),
+        (",", "settings", "Settings…",
+         "Where your footage lives, which local models Distaph uses, and how Claude is connected.",
+         "open"),
     ]
 
     class Ask(ModalScreen[str | None]):
@@ -237,6 +407,65 @@ def tui() -> int:
         def action_cancel(self) -> None:
             self.dismiss(None)
 
+    class Settings(ModalScreen[bool]):
+        """Edit distaph.toml without remembering its format."""
+        BINDINGS = [Binding("escape", "cancel", "Cancel"), Binding("ctrl+s", "save", "Save")]
+
+        def __init__(self, cfg: dict):
+            super().__init__()
+            self.cfg = cfg
+
+        def compose(self) -> ComposeResult:
+            with VerticalScroll(id="settings"):
+                yield Label("Settings", id="dialog-title")
+                yield Static(f"[#8c8098]Library[/]  {library}\n"
+                             f"[#8c8098]To use a different library, hold Option while opening "
+                             f"Distaph, or run [b]distaph init PATH[/].[/]", classes="block")
+                section = None
+                for sec, key, title, hint in SETTINGS_FIELDS:
+                    if sec != section:
+                        section = sec
+                        yield Label({"media": "Footage",
+                                     "models": "Local models (run on this Mac)"}[sec],
+                                    classes="section")
+                    value = str(self.cfg.get(sec, {}).get(key, ""))
+                    extra = ""
+                    if sec == "models":
+                        extra = ("  [#7ec699]downloaded[/]" if model_downloaded(value)
+                                 else "  [#8c8098]downloads on first use[/]")
+                    yield Label(f"{title}{extra}")
+                    yield Input(value=value, id=f"f-{sec}-{key}")
+                    yield Label(hint, classes="muted")
+                claude = shutil.which("claude")
+                yield Label("Claude", classes="section")
+                yield Static(
+                    ("[#7ec699]Claude Code found[/] " + f"[#8c8098]{claude}[/]\n" if claude else
+                     "[#e07a5f]Claude Code isn't installed.[/] Get it at claude.com/claude-code\n")
+                    + "Making cuts, working on narratives and suggesting ideas use Claude Code, "
+                      "signed in with your own Claude account — there's no API key to set here. "
+                      "Claude reads transcripts, captions and your notes through Distaph's "
+                      "commands; your video files stay on your drive.",
+                    classes="block")
+                with Horizontal(id="settings-buttons"):
+                    yield Button("Save", id="save", variant="primary")
+                    yield Button("Cancel", id="cancel")
+                yield Label("Ctrl+S to save · Esc to cancel", classes="muted")
+
+        @on(Button.Pressed, "#save")
+        def action_save(self) -> None:
+            path = library / common.CONFIG_NAME
+            text = path.read_text()
+            for sec, key, _, _ in SETTINGS_FIELDS:
+                new = self.query_one(f"#f-{sec}-{key}", Input).value.strip()
+                if new and new != str(self.cfg.get(sec, {}).get(key, "")):
+                    text = set_toml_value(text, sec, key, new)
+            path.write_text(text)
+            self.dismiss(True)
+
+        @on(Button.Pressed, "#cancel")
+        def action_cancel(self) -> None:
+            self.dismiss(False)
+
     class Launcher(App):
         TITLE = "Distaph"
         CSS = """
@@ -257,14 +486,17 @@ def tui() -> int:
                   background: #120818; border: round #b07cd8; }
         #dialog-title { text-style: bold; color: #eee8f2; padding-bottom: 1; }
         #dialog-options { height: auto; max-height: 20; }
-        Ask, Pick { align: center middle; }
+        Ask, Pick, Settings { align: center middle; }
+        #settings { width: 84; height: 90%; padding: 1 2; background: #120818;
+                    border: round #b07cd8; }
+        #settings Input { margin-bottom: 0; }
+        #settings .block { padding: 0 0 1 0; color: #d2c8da; }
+        #settings-buttons { height: auto; padding-top: 1; }
+        #settings-buttons Button { margin-right: 2; }
         """
-        BINDINGS = [Binding(k, f"act('{i}')", t, show=False)
+        BINDINGS = [Binding("comma" if k == "," else k, f"act('{i}')", t, show=False)
                     for k, i, t, _, kind in ACTIONS if kind != "section"] + [
                     Binding("q", "quit", "Quit")]
-
-        handoff: str | None = None   # a prompt ("" = plain session) for Claude Code
-        busy = False
 
         def compose(self) -> ComposeResult:
             yield Header()
@@ -287,6 +519,15 @@ def tui() -> int:
         def on_mount(self) -> None:
             self.sub_title = str(library)
             self.refresh_status()
+            self.last_drive = self.status_.get("drive_state")
+            self.set_interval(3, self.check_drive)
+            self.jobs: dict[str, dict] = {}
+            if self.status_["ok"]:
+                for job in running_jobs(library):
+                    self.jobs[job["name"]] = job
+                    self.say(f"[b #b07cd8]{job['name']}[/] is still running from before — "
+                             f"showing its progress.")
+            self.set_interval(1, self.tail_jobs)
             menu = self.query_one("#menu", ListView)
             menu.index = 1
             menu.focus()
@@ -295,9 +536,13 @@ def tui() -> int:
             if not st["ok"]:
                 log.write("[b]No library yet.[/] Quit (q) and run "
                           "[b]distaph init[/] in Terminal, then open Distaph again.")
+            elif st["drive_state"] == "attached":
+                log.write(f"[#e07a5f]{st['drive'].name} is plugged in but not mounted.[/] "
+                          f"Press d to mount it.")
             elif not st["mounted"]:
-                log.write(f"[#e07a5f]Your footage drive isn't mounted[/] "
-                          f"({st['drive']}). Plug it in before syncing or searching.")
+                log.write(f"[#e07a5f]Your footage drive isn't connected[/] "
+                          f"({st['drive']}). Plug it in to sync or search; "
+                          f"Distaph will notice.")
             elif st["open_notes"]:
                 log.write("A review note is waiting — press r to open it.")
             elif st["intake_waiting"]:
@@ -306,13 +551,49 @@ def tui() -> int:
             else:
                 log.write("All caught up. Make something?")
 
+        def check_drive(self) -> None:
+            if self.status_.get("ok"):
+                self.poll_drive(Path(self.status_["cfg"]["media"]["drive"]))
+
+        @work(thread=True, exclusive=True, group="drive")
+        def poll_drive(self, drive: Path) -> None:
+            state, _ = drive_state(drive)
+            self.call_from_thread(self.drive_changed, state)
+
+        def drive_changed(self, state: str) -> None:
+            before, self.last_drive = self.last_drive, state
+            if state == before:
+                return
+            self.refresh_status()
+            name = self.status_["drive"].name
+            if state == "mounted":
+                waiting = self.status_["intake_waiting"]
+                self.say(f"\n[#7ec699]{name} is connected.[/]"
+                         + (f" {waiting} new file(s) in intake — press s to sync."
+                            if waiting else ""))
+            elif before == "mounted" and self.writer_running():
+                self.say(f"\n[#e07a5f]{name} was disconnected while a job was running.[/] "
+                         f"It will stop. Reconnect the drive and run it again — finished "
+                         f"work is kept, and sync picks up where it left off.")
+            elif state == "attached":
+                self.say(f"\n{name} is unmounted but still plugged in. "
+                         f"Press d to mount it again, or unplug it.")
+            else:
+                self.say(f"\n{name} is disconnected.")
+
         def refresh_status(self) -> None:
             self.status_ = st = library_status(library)
             if not st["ok"]:
                 text = "[b]Library[/]  not set up"
             else:
-                drive = ("[#7ec699]mounted[/]" if st["mounted"]
-                         else "[#e07a5f]not mounted[/]")
+                drive = {"mounted": "[#7ec699]connected[/]",
+                         "attached": "[#e07a5f]not mounted[/]"}.get(
+                             st["drive_state"], "[#e07a5f]not connected[/]")
+                drive = f"{st['drive'].name} {drive}"
+                label = {"mounted": "Eject drive", "attached": "Mount drive"}.get(
+                    st["drive_state"], "Drive (not connected)")
+                self.query_one("#act-drive Label", Label).update(
+                    f"[b #b07cd8]d[/]  {label}")
                 waiting = st["intake_waiting"]
                 notes = len(st["open_notes"])
                 text = (f"[b]Drive[/] {drive}    "
@@ -320,6 +601,9 @@ def tui() -> int:
                         f"[b]Clips[/] {st['clips']}    [b]Lines[/] {st['segments']}    "
                         f"[b]Narratives[/] {len(st['narratives'])}    "
                         f"[b]Review[/] {'[#b07cd8]' + str(notes) + ' open[/]' if notes else 'clear'}")
+                running = ", ".join(getattr(self, "jobs", {}))
+                if running:
+                    text += f"    [b]Running[/] [#b07cd8]{running}[/]"
             self.query_one("#status", Static).update(text)
 
         @on(ListView.Highlighted)
@@ -351,20 +635,69 @@ def tui() -> int:
         def need_drive(self) -> bool:
             if not self.need_library():
                 return False
+            if self.status_["drive_state"] == "attached":
+                self.say(f"[#e07a5f]{self.status_['drive'].name} isn't mounted.[/] Press d to mount it.")
+                return False
             if not self.status_["mounted"]:
                 self.say(f"[#e07a5f]Plug in your footage drive[/] ({self.status_['drive']}) first.")
                 return False
             return True
 
-        def action_act(self, ident: str) -> None:
-            if self.busy:
-                self.say("Still working on the last thing — hang on.")
+        def do_drive(self) -> None:
+            if not self.need_library():
                 return
+            st = self.status_
+            name = st["drive"].name
+            if st["drive_state"] == "mounted":
+                if (job := self.writer_running()):
+                    self.say(f"{job} is using {name}. Eject it when {job} finishes.")
+                    return
+                self.quick(f"Ejecting {name}", ["diskutil", "eject", str(st["drive"])])
+            elif st["drive_state"] == "attached" and st["drive_device"]:
+                self.quick(f"Mounting {name}", ["diskutil", "mount", st["drive_device"]])
+            else:
+                self.say(f"{name} isn't connected. Plug it in — Distaph will notice.")
+
+        def action_act(self, ident: str) -> None:
             getattr(self, f"do_{ident}")()
+
+        def writer_running(self) -> str | None:
+            return next((n for n in self.jobs if n in WRITER_JOBS), None)
+
+        def start(self, label: str, name: str, args: list[str]) -> None:
+            if (other := self.writer_running()):
+                self.say(f"{other} is running. {label} will be available when it's done "
+                         f"— everything else works meanwhile.")
+                return
+            self.jobs[name] = start_job(library, name, args)
+            self.say(f"\n[b #b07cd8]{label}…[/] [#8c8098](keeps going if you close Distaph)[/]")
+            self.refresh_status()
+
+        def tail_jobs(self) -> None:
+            for name, job in list(self.jobs.items()):
+                try:
+                    with open(job["log"], encoding="utf-8", errors="replace") as f:
+                        f.seek(job["offset"])
+                        chunk = f.read()
+                        job["offset"] = f.tell()
+                except FileNotFoundError:
+                    chunk = ""
+                for line in chunk.splitlines():
+                    self.say(line)
+                proc = job["proc"]
+                code = proc.poll() if proc else (None if pid_alive(job["pid"]) else 0)
+                if code is None:
+                    continue
+                del self.jobs[name]
+                (jobs_dir(library) / f"{name}.pid").unlink(missing_ok=True)
+                self.say(f"[#7ec699]{name} finished.[/]" if code == 0
+                         else f"[#e07a5f]{name} stopped (exit {code}).[/]")
+                self.refresh_status()
+                self.last_drive = self.status_.get("drive_state")
 
         def do_sync(self) -> None:
             if self.need_drive():
-                self.stream("Syncing", ["sync"])
+                self.start("Syncing", "sync", [])
 
         def do_apply(self) -> None:
             if not self.need_drive():
@@ -373,7 +706,7 @@ def tui() -> int:
             if not notes:
                 self.say("No open review note. Sync first, then review.")
                 return
-            self.stream("Applying review", ["apply-review", str(notes[0])])
+            self.start("Applying review", "apply-review", [str(notes[0])])
 
         def do_review(self) -> None:
             if not self.need_library():
@@ -394,14 +727,27 @@ def tui() -> int:
         def do_folder(self) -> None:
             subprocess.call(["open", str(library)])
 
+        def do_settings(self) -> None:
+            if not self.need_library():
+                return
+
+            def closed(saved: bool | None) -> None:
+                if saved:
+                    self.refresh_status()
+                    self.last_drive = self.status_.get("drive_state")
+                    self.say("[#7ec699]Settings saved.[/]"
+                             + (" They apply to the next job; the running one keeps its settings."
+                                if self.jobs else ""))
+            self.push_screen(Settings(self.status_["cfg"]), closed)
+
         def do_find(self) -> None:
             if not self.need_drive():
                 return
 
             def go(query: str | None) -> None:
                 if query:
-                    self.stream(f"Searching for “{query}”", ["search", query, "--k", "15"],
-                                pretty_search=True)
+                    self.quick(f"Searching for “{query}”",
+                               [str(SCRIPTS / "search"), query, "--k", "15"], pretty_search=True)
             self.push_screen(Ask("What are you looking for?",
                                  "e.g. first time the projector worked"), go)
 
@@ -483,17 +829,17 @@ def tui() -> int:
                 self.hand_off("")
 
         def hand_off(self, prompt: str) -> None:
-            self.handoff = prompt
-            self.exit()
+            open_claude_window(library, prompt or None)
+            self.say("Opened Claude Code in a new window. Distaph stays open here.")
 
-        def stream(self, label: str, argv: list[str], pretty_search: bool = False) -> None:
-            self.busy = True
+        def quick(self, label: str, argv: list[str], pretty_search: bool = False) -> None:
+            """A short command whose output shows here; runs alongside any job."""
             self.say(f"\n[b #b07cd8]{label}…[/]")
             self.run_cmd(argv, pretty_search)
 
-        @work(thread=True, exclusive=True)
+        @work(thread=True)
         def run_cmd(self, argv: list[str], pretty_search: bool) -> None:
-            proc = subprocess.Popen([str(SCRIPTS / argv[0]), *argv[1:]],
+            proc = subprocess.Popen(argv,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     text=True, env=child_env(library))
             out = []
@@ -525,17 +871,16 @@ def tui() -> int:
                          f"      [#8c8098]{r.get('id', '')}{at}[/]")
 
         def finish(self, code: int) -> None:
-            self.busy = False
             self.say("[#7ec699]Done.[/]" if code == 0 else f"[#e07a5f]Stopped (exit {code}).[/]")
             self.refresh_status()
+            self.last_drive = self.status_.get("drive_state")
 
-    while True:
-        app = Launcher()
-        app.run()
-        if app.handoff is None:
-            return 0
-        open_claude(library, app.handoff or None)
-        # Back to the menu when Claude Code exits — state may have changed.
+    app = Launcher()
+    app.run()
+    left = ", ".join(getattr(app, "jobs", {}))
+    if left:
+        print(f"{left} is still running in the background. Open Distaph to see how it's going.")
+    return 0
 
 
 # ----------------------------------------------------------------------- main

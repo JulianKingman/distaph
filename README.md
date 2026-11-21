@@ -78,6 +78,12 @@ it. Nothing to memorize.
 | n | Work on a narrative… | hands off to Claude Code |
 | i | Suggest ideas | hands off to Claude Code (early) |
 | t | Talk to Claude | Claude Code in your library |
+| d | Mount / eject drive | watches the drive and notices when it comes and goes |
+| , | Settings | footage folders, local models, how Claude is connected |
+
+Nothing waits on anything else: you can open Obsidian, search or start Claude
+while a sync runs. Sync and apply-review run one at a time (both write the
+database) and keep going if you close Distaph. Claude opens in its own window.
 
 Every action is also a command: `distaph sync`, `distaph search "…"`,
 `distaph build cuts/x.json --fcpxml cuts/x.fcpxml`, and so on.

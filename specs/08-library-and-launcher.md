@@ -78,6 +78,24 @@ Hybrid by kind of work:
   prompt with the context filled in and hands off to Claude Code in the
   library, with the skill linked. When Claude Code exits, the menu returns.
 
+Concurrency (amended 2026-11-21):
+
+- Nothing in the launcher blocks anything else, except that the two jobs that
+  write the database and commit the library (sync, apply-review) run one at a
+  time. They run detached with output to `<library>/.distaph/jobs/*.log`, so
+  they survive the launcher closing; a reopened launcher finds them by pid
+  file and resumes showing their output.
+- Claude Code opens in its own terminal window, so the menu stays usable.
+- The drive is polled every few seconds. The launcher notices it arriving,
+  leaving, or being unmounted-but-plugged-in, offers mount/eject, and refuses
+  to eject while a job is using it. A job interrupted by a disconnect is safe
+  to rerun: every stage is idempotent.
+
+Settings are edited from the launcher (`,`), not by hand: footage folders and
+the three local models (with whether each is downloaded), plus how Claude is
+connected (Claude Code, signed in with the user's own account — Distaph holds
+no API keys). Edits are written back into `distaph.toml` keeping its comments.
+
 Entry points:
 
 - `Distaph.app` — a small native wrapper (Swift, `macos/Distaph/`, built with

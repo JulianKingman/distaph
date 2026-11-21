@@ -12,6 +12,9 @@ cuts/*.txt
 # Points at your Distaph install; the launcher recreates it.
 .claude/skills/distaph
 
+# Launcher job logs and process ids.
+.distaph/
+
 # Obsidian per-device UI state.
 vault/.obsidian/workspace*
 vault/.obsidian/cache
