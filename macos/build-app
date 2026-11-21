@@ -1,59 +1,37 @@
 #!/bin/bash
-# Build Distaph.app next to this repo: a tiny launcher that opens Terminal
-# into the Distaph menu. Run it once after cloning (or after moving the folder):
+# Build Distaph.app with Xcode and put `distaph` on your PATH. Run it once
+# after cloning, and again after pulling changes to macos/:
 #
 #   /Applications/Distaph/macos/build-app
 #
-# The .app holds no code or data — it just runs bin/distaph from the folder it
-# sits in, so moving the whole folder keeps it working. It's gitignored and
-# safe to rebuild any time.
+# Same result as opening macos/Distaph/Distaph.xcodeproj in Xcode and pressing
+# Run: the build copies Distaph.app to the root of this folder, next to bin/.
+# The app holds no code or data, so it's safe to rebuild any time.
+#
+# Open Distaph with Option held to choose a different library.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-APP="$ROOT/Distaph.app"
-ICON="$ROOT/assets/icon/distaph-icon-1024.png"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
-command -v uv >/dev/null || {
-  echo "Distaph needs uv (it runs the scripts and their dependencies)."
-  echo "Install it:  curl -LsSf https://astral.sh/uv/install.sh | sh"
+if ! xcodebuild -version >/dev/null 2>&1; then
+  echo "Building Distaph.app needs Xcode (the full app, not just the command line tools)."
+  echo "Install it from the App Store, open it once, then run this again."
   exit 1
+fi
+command -v uv >/dev/null || {
+  echo "Note: Distaph needs uv to run. Install it with:"
+  echo "  curl -LsSf https://astral.sh/uv/install.sh | sh"
 }
 
-cat > "$WORK/launch.applescript" <<'APPLESCRIPT'
-on run
-	set appPath to POSIX path of (path to me)
-	set rootPath to do shell script "dirname " & quoted form of appPath
-	set cmd to "clear; " & quoted form of (rootPath & "/bin/distaph") & "; exit"
-	tell application "Terminal"
-		activate
-		do script cmd
-	end tell
-end run
-APPLESCRIPT
+xcodebuild -quiet \
+  -project "$ROOT/macos/Distaph/Distaph.xcodeproj" \
+  -target Distaph -configuration Release \
+  SYMROOT="$WORK/build" OBJROOT="$WORK/obj" build
 
-rm -rf "$APP"
-osacompile -o "$APP" "$WORK/launch.applescript"
+echo "Built $ROOT/Distaph.app"
 
-ICONSET="$WORK/Distaph.iconset"
-mkdir "$ICONSET"
-for s in 16 32 128 256 512; do
-  sips -z "$s" "$s" "$ICON" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
-  d=$((s * 2))
-  sips -z "$d" "$d" "$ICON" --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
-done
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/applet.icns"
-
-PLIST="$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Set :CFBundleName Distaph" "$PLIST"
-/usr/libexec/PlistBuddy -c "Add :CFBundleIdentifier string com.distaph.launcher" "$PLIST" 2>/dev/null \
-  || /usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier com.distaph.launcher" "$PLIST"
-touch "$APP"
-
-echo "Built $APP"
-
-# Put `distaph` on your PATH too, where that needs no sudo.
 for dir in /opt/homebrew/bin "$HOME/.local/bin"; do
   if [ -d "$dir" ] && [ -w "$dir" ]; then
     ln -sf "$ROOT/bin/distaph" "$dir/distaph"

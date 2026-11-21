@@ -14,3 +14,8 @@ Distaph.app/
 /config.toml
 *.sqlite
 *.sqlite-*
+
+# Xcode per-user state and local builds.
+macos/Distaph/Distaph.xcodeproj/project.xcworkspace/
+macos/Distaph/Distaph.xcodeproj/xcuserdata/
+macos/Distaph/build/

@@ -78,6 +78,14 @@ Hybrid by kind of work:
   prompt with the context filled in and hands off to Claude Code in the
   library, with the skill linked. When Claude Code exits, the menu returns.
 
-Entry points: `Distaph.app` (built by `macos/build-app`, opens Terminal into
-the menu), and `distaph` on the PATH (`distaph <command>` runs any script).
-The `.app` and the CLI are the same program.
+Entry points:
+
+- `Distaph.app` — a small native wrapper (Swift, `macos/Distaph/`, built with
+  Xcode or `macos/build-app`). It finds the library, asks you to choose or
+  create one when there isn't one (or when you hold Option), saves the choice
+  to `~/.config/distaph/library`, and opens Terminal running the menu. It
+  writes a one-shot `.command` file rather than scripting Terminal, so it
+  needs no Automation permission and respects your default terminal.
+- `distaph` on the PATH — the same menu, and `distaph <command>` for any script.
+
+Both read the same library pointer, so they always agree.

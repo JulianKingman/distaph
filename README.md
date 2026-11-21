@@ -46,18 +46,22 @@ in files you own.
 
 ## Install
 
-Requirements: an Apple Silicon Mac, [uv](https://docs.astral.sh/uv/),
-`ffmpeg`, [Claude Code](https://claude.com/claude-code) for the judgment
+Requirements: an Apple Silicon Mac, Xcode (to build the app),
+[uv](https://docs.astral.sh/uv/), `ffmpeg`, [Claude Code](https://claude.com/claude-code) for the judgment
 features, and DaVinci Resolve (Studio recommended) for finishing.
 
 ```sh
 git clone https://github.com/JulianKingman/distaph /Applications/Distaph
-/Applications/Distaph/macos/build-app     # builds Distaph.app, links `distaph`
-distaph init                              # creates ~/Distaph, your library
+/Applications/Distaph/macos/build-app     # builds Distaph.app with Xcode, links `distaph`
 ```
 
-Edit `~/Distaph/distaph.toml` to point at your footage drive, then open
-**Distaph** from Spotlight or Launchpad.
+Open **Distaph** from Spotlight or Launchpad. The first time, it asks you to
+choose a library folder or create one (`~/Distaph` is a good default), then
+opens your settings so you can point it at your footage drive. Hold **Option**
+while opening Distaph to switch libraries later.
+
+You can also build the app by opening `macos/Distaph/Distaph.xcodeproj` and
+pressing Run. Either way it lands in `/Applications/Distaph/Distaph.app`.
 
 ## The launcher
 
