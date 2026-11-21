@@ -1,0 +1,308 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Distaph — spin a lifetime of footage into stories</title>
+<meta name="description" content="Distaph is an open-source tool for Mac that catalogs every clip you've ever recorded, keeps your editorial judgments in files you own, and spins real moments into rough cuts for DaVinci Resolve.">
+<meta property="og:title" content="Distaph">
+<meta property="og:description" content="Spin a lifetime of footage into stories. Open source, local, and incapable of making things up.">
+<meta property="og:image" content="https://distaph.com/og.png">
+<meta property="og:url" content="https://distaph.com/">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/png" sizes="32x32" href="favicon-32.png">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Young+Serif&family=Atkinson+Hyperlegible+Next:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --midnight: #0e1a3a;
+    --deep: #0a1230;
+    --panel: #132147;
+    --wool: #ece4d0;
+    --wool-dim: #c7c0ae;
+    --gold: #c9a35b;
+    --gold-bright: #e2bf78;
+    --slate: #8b93b0;
+    --rule: #26335f;
+    --gutter: 88px;
+    --measure: 40rem;
+    --serif: "Young Serif", Georgia, serif;
+    --sans: "Atkinson Hyperlegible Next", system-ui, sans-serif;
+    --mono: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { box-sizing: border-box; }
+  html { background: var(--midnight); }
+  body {
+    margin: 0; background: var(--midnight); color: var(--wool);
+    font: 400 1.125rem/1.6 var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--gold-bright); text-underline-offset: 0.18em; }
+  a:hover { color: var(--wool); }
+  :focus-visible { outline: 2px solid var(--gold-bright); outline-offset: 3px; border-radius: 2px; }
+
+  .page { position: relative; padding-left: var(--gutter); padding-right: 24px; max-width: 64rem; margin: 0 auto; }
+
+  /* The thread: one gold line down the gutter, drawn once on load. */
+  .thread { position: absolute; left: 0; top: 0; width: var(--gutter); height: 100%; pointer-events: none; }
+  .thread path { fill: none; stroke: var(--gold); stroke-width: 2.25; stroke-linecap: round;
+                 stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw 2.6s cubic-bezier(.45,.05,.2,1) .35s forwards; }
+  @keyframes draw { to { stroke-dashoffset: 0; } }
+  @media (prefers-reduced-motion: reduce) { .thread path { animation: none; stroke-dashoffset: 0; } }
+
+  /* Each section is a knot on the thread. */
+  .knot { position: relative; padding: 4.5rem 0 1rem; max-width: var(--measure); }
+  .knot::before { content: ""; position: absolute; left: calc(-1 * var(--gutter) / 2 - 7px); top: 5.15rem;
+                  width: 14px; height: 14px; border-radius: 50%; background: var(--midnight);
+                  border: 2.25px solid var(--gold); }
+
+  header.top { display: flex; align-items: center; justify-content: space-between; padding: 1.5rem 0; }
+  .wordmark { display: flex; align-items: center; gap: .7rem; color: var(--wool); text-decoration: none;
+              font: 400 1.35rem/1 var(--serif); }
+  .wordmark img { width: 34px; height: 34px; }
+  header.top nav a { color: var(--wool-dim); text-decoration: none; margin-left: 1.5rem; font-size: 1rem; }
+  header.top nav a:hover { color: var(--wool); }
+
+  .hero { padding: 5rem 0 3rem; max-width: 46rem; position: relative; }
+  .hero img.mark { width: 132px; height: 132px; display: block; margin-bottom: 2.25rem;
+                   filter: drop-shadow(0 18px 30px rgba(3, 7, 22, .55)); }
+  h1 { font: 400 clamp(2.6rem, 6.4vw, 4.6rem)/1.04 var(--serif); letter-spacing: -0.015em; margin: 0 0 1.5rem; }
+  .lede { font-size: 1.3rem; line-height: 1.55; color: var(--wool-dim); max-width: 36rem; margin: 0 0 2.25rem; }
+  .actions { display: flex; flex-wrap: wrap; gap: .9rem; }
+  .btn { display: inline-block; padding: .8rem 1.35rem; border-radius: 999px; text-decoration: none;
+         font-weight: 600; font-size: 1.02rem; border: 2px solid var(--gold); }
+  .btn.primary { background: var(--gold); color: var(--deep); }
+  .btn.primary:hover { background: var(--gold-bright); border-color: var(--gold-bright); color: var(--deep); }
+  .btn.secondary { color: var(--wool); }
+  .btn.secondary:hover { background: rgba(201,163,91,.12); color: var(--wool); }
+
+  h2 { font: 400 clamp(1.7rem, 3.4vw, 2.3rem)/1.15 var(--serif); margin: 0 0 1.1rem; }
+  h3 { font: 600 1.15rem/1.35 var(--sans); margin: 0 0 .35rem; color: var(--wool); }
+  p { margin: 0 0 1rem; }
+  .muted { color: var(--slate); }
+
+  .etymology { font-size: 1.22rem; line-height: 1.65; color: var(--wool-dim); }
+  .etymology em { color: var(--wool); font-style: italic; }
+
+  ol.steps { list-style: none; padding: 0; margin: 1.5rem 0 0; counter-reset: step; }
+  ol.steps li { counter-increment: step; display: grid; grid-template-columns: 2.4rem 1fr; gap: .25rem 1rem; padding: .9rem 0; border-top: 1px solid var(--rule); }
+  ol.steps li::before { content: counter(step); font: 400 1.45rem/1.2 var(--serif); color: var(--gold); grid-row: span 2; }
+  ol.steps p { margin: 0; color: var(--wool-dim); }
+
+  dl.diff { margin: 1.75rem 0 0; }
+  dl.diff div { padding: 1.1rem 0 1.15rem; border-top: 1px solid var(--rule); }
+  dl.diff dt { font: 400 1.3rem/1.3 var(--serif); margin-bottom: .35rem; }
+  dl.diff dd { margin: 0; color: var(--wool-dim); }
+
+  pre, code { font-family: var(--mono); font-size: .9rem; }
+  code { background: var(--panel); padding: .1em .35em; border-radius: 4px; color: var(--wool); }
+  pre { background: var(--deep); border: 1px solid var(--rule); border-radius: 10px; padding: 1.1rem 1.25rem;
+        overflow-x: auto; line-height: 1.55; margin: 1.25rem 0; color: var(--wool-dim); }
+  pre code { background: none; padding: 0; }
+  .k { color: var(--gold); }
+  .ok { color: #8fcf9f; }
+  .bad { color: #e48a7a; }
+  .c { color: var(--slate); }
+
+  .figure-caption { font-size: .95rem; color: var(--slate); margin-top: -.5rem; }
+
+  /* The launcher, as it looks in Terminal. */
+  .launcher { background: var(--deep); border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; margin: 1.5rem 0 .75rem;
+              font: .88rem/1.55 var(--mono); max-width: 44rem; }
+  .launcher .bar { display: flex; gap: .45rem; padding: .6rem .8rem; background: #0c1533; border-bottom: 1px solid var(--rule); }
+  .launcher .bar i { width: 11px; height: 11px; border-radius: 50%; background: #2e3b66; display: block; }
+  .launcher .status { padding: .55rem 1rem; color: var(--wool); background: #121c3d; display: flex; flex-wrap: wrap; gap: .2rem 1.4rem; }
+  .launcher .status b { font-weight: 600; }
+  .launcher .body { display: grid; grid-template-columns: 15.5rem 1fr; min-height: 15rem; }
+  .launcher ul { list-style: none; margin: 0; padding: .6rem .5rem; border-right: 1px solid var(--rule); }
+  .launcher li { padding: 0 .5rem; color: var(--wool-dim); white-space: nowrap; }
+  .launcher li.group { color: var(--gold); font-weight: 600; padding-top: .55rem; }
+  .launcher li.on { background: #2a3766; color: var(--wool); border-radius: 3px; }
+  .launcher li kbd { font: inherit; color: var(--gold); margin-right: .55rem; }
+  .launcher .side { padding: .9rem 1rem; color: var(--wool-dim); }
+  .launcher .side strong { color: var(--wool); font-weight: 600; }
+  .launcher .side .tag { color: var(--slate); }
+
+  .tree { color: var(--wool-dim); }
+  .tree .n { color: var(--wool); }
+
+  .status-list { columns: 2; column-gap: 2.5rem; padding-left: 1.1rem; margin: .5rem 0 1.25rem; color: var(--wool-dim); }
+  .status-list li { break-inside: avoid; margin-bottom: .2rem; }
+
+  footer { padding: 4rem 0 3.5rem; color: var(--slate); font-size: .98rem; max-width: var(--measure); }
+  footer p { margin: .25rem 0; }
+
+  @media (max-width: 720px) {
+    :root { --gutter: 36px; }
+    body { font-size: 1.05rem; }
+    .page { padding-right: 18px; }
+    .knot { padding-top: 3.5rem; }
+    .knot::before { top: 4.1rem; width: 12px; height: 12px; left: calc(-1 * var(--gutter) / 2 - 6px); }
+    header.top nav a { margin-left: .9rem; font-size: .95rem; }
+    header.top nav a.wide { display: none; }
+    .hero { padding-top: 2.5rem; }
+    .hero img.mark { width: 96px; height: 96px; }
+    .launcher .body { grid-template-columns: 1fr; }
+    .launcher ul { border-right: 0; border-bottom: 1px solid var(--rule); }
+    .status-list { columns: 1; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <svg class="thread" aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 88 1000">
+    <path pathLength="1" d="M44 0 C 39 60, 49 120, 44 180 S 39 300, 44 360 S 49 480, 44 540 S 39 660, 44 720 S 49 840, 44 900 S 43 960, 44 1000"/>
+  </svg>
+
+  <header class="top">
+    <a class="wordmark" href="/"><img src="icon-512.png" alt="" width="34" height="34">Distaph</a>
+    <nav aria-label="Main">
+      <a class="wide" href="#how">How it works</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/JulianKingman/distaph">GitHub</a>
+    </nav>
+  </header>
+
+  <main>
+    <section class="hero">
+      <img class="mark" src="icon-512.png" alt="The Distaph icon: a film strip spiraling around a spinning staff, turning into data, then a gold thread." width="132" height="132">
+      <h1>Spin a lifetime of footage into stories.</h1>
+      <p class="lede">Distaph catalogs every clip you've ever recorded, keeps your editorial judgments in files you own, and spins real moments from across the years into rough cuts that open in DaVinci Resolve.</p>
+      <div class="actions">
+        <a class="btn primary" href="https://github.com/JulianKingman/distaph">Get it on GitHub</a>
+        <a class="btn secondary" href="#how">See how it works</a>
+      </div>
+    </section>
+
+    <section class="knot" aria-labelledby="name">
+      <h2 id="name">Why the name</h2>
+      <p class="etymology">A <em>distaff</em> is the staff that holds raw wool while a spinner draws it out and twists it into one continuous thread. Your footage is the wool: years of it, tangled across drives and projects. Distaph holds all of it and helps you draw out the strands that belong together.</p>
+    </section>
+
+    <section class="knot" id="how" aria-labelledby="how-h">
+      <h2 id="how-h">How it works</h2>
+      <p>You record. Distaph does the logging. You decide what matters.</p>
+      <ol class="steps">
+        <li><h3>Drop footage in your intake folder</h3><p>Old archives and yesterday's clips alike. That's the whole import step.</p></li>
+        <li><h3>Sync</h3><p>Each file is stored by its content hash, dated from its own metadata, transcribed with Whisper, captioned frame by frame, and made searchable. All of it runs on your Mac.</p></li>
+        <li><h3>Review in Obsidian</h3><p>Proposed project tags, undated clips and likely duplicates arrive as a checklist. Tick what you agree with and apply. Nothing is filed without you.</p></li>
+        <li><h3>Ask for a video</h3><p>Describe it, or start from a narrative. Claude chooses and orders real moments; Distaph checks every one and builds the timeline.</p></li>
+        <li><h3>Finish in Resolve</h3><p>Import the FCPXML and do the part that's yours: pacing, color, sound.</p></li>
+      </ol>
+    </section>
+
+    <section class="knot" aria-labelledby="diff-h">
+      <h2 id="diff-h">What it does differently</h2>
+      <p>Plenty of tools turn one shoot into one rough cut. Distaph is built for the long run: everything you've filmed, organized the way you think about it, still useful in ten years.</p>
+      <dl class="diff">
+        <div>
+          <dt>Narratives outlive videos</dt>
+          <dd>A narrative is a named, ordered thread of real moments, separate from any project or finished video. It keeps growing as you keep filming. One narrative can become many videos, and one video can draw on many narratives.</dd>
+        </div>
+        <div>
+          <dt>Your judgments live in your files</dt>
+          <dd>Transcripts and timecodes are facts the machine can always regenerate. Which project a clip belongs to, what order a story goes in, what counts as a good take: those are yours, kept as plain markdown in an Obsidian vault. Either side can be rebuilt without touching the other.</dd>
+        </div>
+        <div>
+          <dt>Your library is a git repository</dt>
+          <dd>Every sync and every review is a commit, so you can see how your archive and your thinking about it changed over time. Transcripts are versioned as text. Distaph never pushes anywhere.</dd>
+        </div>
+        <div>
+          <dt>Local and open</dt>
+          <dd>Transcription, captioning and search run on Apple Silicon. Footage never leaves your drive. The code is MIT-licensed.</dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="knot" aria-labelledby="real-h">
+      <h2 id="real-h">It can't put words in your mouth</h2>
+      <p>When AI edits from a transcript, it's tempted to tidy what you said. Distaph doesn't give it the chance. A cut is a list of pointers to segments that were actually recorded, never text:</p>
+<pre><code>{"name": "projector-build", "segments": [
+  {"id": "seg_fe2298880c97_r1_0000", "pip": true},
+  {"id": "seg_18cc16b61141_r1_0019"},
+  {"id": "seg_18cc16b61141_r1_0042"}
+]}</code></pre>
+      <p>Before anything is built, every pointer is checked against the database. One that doesn't exist stops the cut:</p>
+<pre><code><span class="c">$</span> distaph validate --cut cuts/projector-build.json
+{
+  "checked": 3,
+  "missing": [<span class="bad">"seg_18cc16b61141_r1_0042"</span>],
+  "bounds": [],
+  "drift": [],
+  "ok": <span class="bad">false</span>
+}</code></pre>
+      <p class="figure-caption">The timeline is assembled by code, from the database, using only pointers that passed this check. There's no path for invented text to reach it.</p>
+    </section>
+
+    <section class="knot" aria-labelledby="launch-h">
+      <h2 id="launch-h">Nothing to memorize</h2>
+      <p>Open Distaph and you get a menu of everything it does, in the order you'd do it. Pick a narrative or project from a list instead of remembering its name. Cataloging runs right there; making things hands off to Claude Code with the context already written, and brings you back when you're done.</p>
+      <div class="launcher" role="img" aria-label="The Distaph launcher in Terminal: a status line, a menu of actions grouped into Every day, Make something and Library, and a description of the highlighted action.">
+        <div class="bar"><i></i><i></i><i></i></div>
+        <div class="status"><span><b>Drive</b> <span class="ok">mounted</span></span><span><b>Intake</b> 12 waiting</span><span><b>Clips</b> 1,284</span><span><b>Narratives</b> 7</span><span><b>Review</b> <span class="k">1 open</span></span></div>
+        <div class="body">
+          <ul>
+            <li class="group">Every day</li>
+            <li><kbd>s</kbd>Sync new footage</li>
+            <li><kbd>r</kbd>Review in Obsidian</li>
+            <li><kbd>a</kbd>Apply review</li>
+            <li><kbd>f</kbd>Find footage</li>
+            <li class="group">Make something</li>
+            <li class="on"><kbd>c</kbd>Make a cut…</li>
+            <li><kbd>n</kbd>Work on a narrative…</li>
+            <li><kbd>i</kbd>Suggest ideas</li>
+            <li><kbd>t</kbd>Talk to Claude</li>
+          </ul>
+          <div class="side"><strong>Make a cut…</strong> <span class="tag">(opens Claude Code)</span><br>Describe a video. Claude picks real lines and builds a Resolve timeline.</div>
+        </div>
+      </div>
+      <p class="figure-caption">Every action is also a command: <code>distaph sync</code>, <code>distaph search "…"</code>, <code>distaph build</code>.</p>
+    </section>
+
+    <section class="knot" aria-labelledby="lib-h">
+      <h2 id="lib-h">Your library is yours</h2>
+      <p>The app and your data never mix. Distaph lives in Applications; everything it knows about your footage lives in one folder you own.</p>
+<pre class="tree"><code><span class="n">~/Distaph/</span>
+├── <span class="n">distaph.toml</span>   where your footage lives
+├── <span class="n">vault/</span>         projects, narratives, reviews — open in Obsidian
+├── <span class="n">facts/</span>         transcripts and metadata as text, versioned
+├── <span class="n">cuts/</span>          cut lists, versioned; timelines rebuilt on demand
+└── <span class="n">db/</span>            working database, rebuilt from facts/</code></pre>
+      <p>If you add a remote to back it up, make it private. It's a record of your life.</p>
+    </section>
+
+    <section class="knot" id="install" aria-labelledby="install-h">
+      <h2 id="install-h">Install</h2>
+      <p>You'll need an Apple Silicon Mac, <a href="https://docs.astral.sh/uv/">uv</a>, ffmpeg, <a href="https://claude.com/claude-code">Claude Code</a> for the making features, and DaVinci Resolve to finish in.</p>
+<pre><code>git clone https://github.com/JulianKingman/distaph \
+  /Applications/Distaph
+/Applications/Distaph/macos/build-app
+distaph init</code></pre>
+      <p>Then point <code>~/Distaph/distaph.toml</code> at your footage drive and open Distaph from Spotlight.</p>
+    </section>
+
+    <section class="knot" aria-labelledby="status-h">
+      <h2 id="status-h">Where it stands</h2>
+      <p>Early and opinionated. Working now:</p>
+      <ul class="status-list">
+        <li>Content-addressed ingest and metadata dating</li>
+        <li>Local transcription and keyframe captions</li>
+        <li>Semantic search over lines and shots</li>
+        <li>The review checklist in Obsidian</li>
+        <li>Validated cuts with picture-in-picture</li>
+        <li>FCPXML export to Resolve</li>
+        <li>Versioned libraries and the launcher</li>
+      </ul>
+      <p>Next: summaries at every level from clip to archive, richer narrative tooling, and suggestions for what to make from what you already have. The design is written down in <a href="https://github.com/JulianKingman/distaph/tree/main/specs">the specs</a>; issues and pull requests are welcome.</p>
+    </section>
+  </main>
+
+  <footer>
+    <p>Distaph is free software under the MIT license.</p>
+    <p><a href="https://github.com/JulianKingman/distaph">Source on GitHub</a></p>
+  </footer>
+</div>
+</body>
+</html>
