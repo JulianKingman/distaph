@@ -7,12 +7,12 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		D15A0001000000000000A001 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = D15A0001000000000000F001 /* main.swift */; };
+		D15A0001000000000000A001 /* DistaphApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = D15A0001000000000000F001 /* DistaphApp.swift */; };
 		D15A0001000000000000A002 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = D15A0001000000000000F002 /* Assets.xcassets */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		D15A0001000000000000F001 /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
+		D15A0001000000000000F001 /* DistaphApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DistaphApp.swift; sourceTree = "<group>"; };
 		D15A0001000000000000F002 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		D15A0001000000000000F003 /* Distaph.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Distaph.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -39,7 +39,7 @@
 		D15A0001000000000000C002 /* Distaph */ = {
 			isa = PBXGroup;
 			children = (
-				D15A0001000000000000F001 /* main.swift */,
+				D15A0001000000000000F001 /* DistaphApp.swift */,
 				D15A0001000000000000F002 /* Assets.xcassets */,
 			);
 			path = Distaph;
@@ -146,7 +146,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				D15A0001000000000000A001 /* main.swift in Sources */,
+				D15A0001000000000000A001 /* DistaphApp.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
