@@ -240,22 +240,22 @@ def tui() -> int:
     class Launcher(App):
         TITLE = "Distaph"
         CSS = """
-        Screen { background: #0d1530; }
-        Header { background: #0d1530; color: #e9e2d0; }
-        #status { height: auto; padding: 1 2; color: #e9e2d0; background: #121c3d; }
+        Screen { background: #000000; }
+        Header { background: #000000; color: #eee8f2; }
+        #status { height: auto; padding: 1 2; color: #eee8f2; background: #120818; }
         #body { height: 1fr; }
-        #menu { width: 34; height: 1fr; border-right: solid #2a3766; background: #0d1530; }
-        #menu > ListItem { padding: 0 1; background: #0d1530; }
-        #menu > ListItem.--highlight { background: #2a3766; }
-        .section { color: #c9a35b; text-style: bold; padding-top: 1; }
-        .key { color: #c9a35b; text-style: bold; }
-        .muted { color: #8b93b0; }
+        #menu { width: 34; height: 1fr; border-right: solid #3a1748; background: #000000; }
+        #menu > ListItem { padding: 0 1; background: #000000; }
+        #menu > ListItem.--highlight { background: #3a1748; }
+        .section { color: #b07cd8; text-style: bold; padding-top: 1; }
+        .key { color: #b07cd8; text-style: bold; }
+        .muted { color: #8c8098; }
         #right { padding: 0 1; }
-        #hint { height: auto; padding: 1 1; color: #c9cfe3; }
-        #log { height: 1fr; background: #0a1026; border: round #2a3766; }
+        #hint { height: auto; padding: 1 1; color: #d2c8da; }
+        #log { height: 1fr; background: #08030b; border: round #3a1748; }
         #dialog { width: 72; height: auto; max-height: 80%; padding: 1 2;
-                  background: #121c3d; border: round #c9a35b; }
-        #dialog-title { text-style: bold; color: #e9e2d0; padding-bottom: 1; }
+                  background: #120818; border: round #b07cd8; }
+        #dialog-title { text-style: bold; color: #eee8f2; padding-bottom: 1; }
         #dialog-options { height: auto; max-height: 20; }
         Ask, Pick { align: center middle; }
         """
@@ -276,7 +276,7 @@ def tui() -> int:
                         items.append(ListItem(Label(title, classes="section"),
                                               disabled=True))
                     else:
-                        items.append(ListItem(Label(f"[b #c9a35b]{key}[/]  {title}"),
+                        items.append(ListItem(Label(f"[b #b07cd8]{key}[/]  {title}"),
                                               id=f"act-{ident}"))
                 yield ListView(*items, id="menu")
                 with Vertical(id="right"):
@@ -319,7 +319,7 @@ def tui() -> int:
                         f"[b]Intake[/] {'—' if waiting is None else waiting} waiting    "
                         f"[b]Clips[/] {st['clips']}    [b]Lines[/] {st['segments']}    "
                         f"[b]Narratives[/] {len(st['narratives'])}    "
-                        f"[b]Review[/] {'[#c9a35b]' + str(notes) + ' open[/]' if notes else 'clear'}")
+                        f"[b]Review[/] {'[#b07cd8]' + str(notes) + ' open[/]' if notes else 'clear'}")
             self.query_one("#status", Static).update(text)
 
         @on(ListView.Highlighted)
@@ -329,7 +329,7 @@ def tui() -> int:
             ident = e.item.id.removeprefix("act-")
             for _, i, title, hint, kind in ACTIONS:
                 if i == ident:
-                    tag = {"claude": "  [#8b93b0](opens Claude Code)[/]"}.get(kind, "")
+                    tag = {"claude": "  [#8c8098](opens Claude Code)[/]"}.get(kind, "")
                     self.query_one("#hint", Static).update(f"[b]{title}[/]{tag}\n{hint}")
 
         @on(ListView.Selected)
@@ -488,7 +488,7 @@ def tui() -> int:
 
         def stream(self, label: str, argv: list[str], pretty_search: bool = False) -> None:
             self.busy = True
-            self.say(f"\n[b #c9a35b]{label}…[/]")
+            self.say(f"\n[b #b07cd8]{label}…[/]")
             self.run_cmd(argv, pretty_search)
 
         @work(thread=True, exclusive=True)
@@ -521,8 +521,8 @@ def tui() -> int:
                 text = r.get("text") or r.get("caption") or r.get("visual_summary") or ""
                 when = r.get("t_in", r.get("t"))
                 at = f" @ {when:.0f}s" if isinstance(when, (int, float)) else ""
-                self.say(f"[#8b93b0]{r['score']:.2f}[/]  {text.strip()[:140]}\n"
-                         f"      [#8b93b0]{r.get('id', '')}{at}[/]")
+                self.say(f"[#8c8098]{r['score']:.2f}[/]  {text.strip()[:140]}\n"
+                         f"      [#8c8098]{r.get('id', '')}{at}[/]")
 
         def finish(self, code: int) -> None:
             self.busy = False

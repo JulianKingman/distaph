@@ -17,15 +17,15 @@
 <link href="https://fonts.googleapis.com/css2?family=Young+Serif&family=Atkinson+Hyperlegible+Next:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet">
 <style>
   :root {
-    --midnight: #0e1a3a;
-    --deep: #0a1230;
-    --panel: #132147;
-    --wool: #ece4d0;
-    --wool-dim: #c7c0ae;
-    --gold: #c9a35b;
-    --gold-bright: #e2bf78;
-    --slate: #8b93b0;
-    --rule: #26335f;
+    --midnight: #000000;
+    --deep: #08030b;
+    --panel: #150a1b;
+    --wool: #eee8f2;
+    --wool-dim: #c4b9cc;
+    --gold: #a868d4;
+    --gold-bright: #c895ec;
+    --slate: #8c8098;
+    --rule: #2a1534;
     --gutter: 88px;
     --measure: 40rem;
     --serif: "Young Serif", Georgia, serif;
@@ -47,8 +47,10 @@
 
   /* The thread: one gold line down the gutter, drawn once on load. */
   .thread { position: absolute; left: 0; top: 0; width: var(--gutter); height: 100%; pointer-events: none; }
-  .thread path { fill: none; stroke: var(--gold); stroke-width: 2.25; stroke-linecap: round;
-                 stroke-dasharray: 1; stroke-dashoffset: 1; animation: draw 2.6s cubic-bezier(.45,.05,.2,1) .35s forwards; }
+  .thread path { fill: none; stroke-linecap: round; stroke-dasharray: 1; stroke-dashoffset: 1;
+                 animation: draw 2.6s cubic-bezier(.45,.05,.2,1) .35s forwards; }
+  .thread .glow { stroke: #5a1270; stroke-width: 14; opacity: .75; filter: url(#soft); }
+  .thread .core { stroke: var(--gold); stroke-width: 1.75; }
   @keyframes draw { to { stroke-dashoffset: 0; } }
   @media (prefers-reduced-motion: reduce) { .thread path { animation: none; stroke-dashoffset: 0; } }
 
@@ -56,7 +58,7 @@
   .knot { position: relative; padding: 4.5rem 0 1rem; max-width: var(--measure); }
   .knot::before { content: ""; position: absolute; left: calc(-1 * var(--gutter) / 2 - 7px); top: 5.15rem;
                   width: 14px; height: 14px; border-radius: 50%; background: var(--midnight);
-                  border: 2.25px solid var(--gold); }
+                  border: 2px solid var(--gold-bright); box-shadow: 0 0 14px 3px rgba(130, 40, 170, .6); }
 
   header.top { display: flex; align-items: center; justify-content: space-between; padding: 1.5rem 0; }
   .wordmark { display: flex; align-items: center; gap: .7rem; color: var(--wool); text-decoration: none;
@@ -67,16 +69,16 @@
 
   .hero { padding: 5rem 0 3rem; max-width: 46rem; position: relative; }
   .hero img.mark { width: 132px; height: 132px; display: block; margin-bottom: 2.25rem;
-                   filter: drop-shadow(0 18px 30px rgba(3, 7, 22, .55)); }
+                   filter: drop-shadow(0 0 40px rgba(110, 20, 140, .45)); }
   h1 { font: 400 clamp(2.6rem, 6.4vw, 4.6rem)/1.04 var(--serif); letter-spacing: -0.015em; margin: 0 0 1.5rem; }
   .lede { font-size: 1.3rem; line-height: 1.55; color: var(--wool-dim); max-width: 36rem; margin: 0 0 2.25rem; }
   .actions { display: flex; flex-wrap: wrap; gap: .9rem; }
   .btn { display: inline-block; padding: .8rem 1.35rem; border-radius: 999px; text-decoration: none;
          font-weight: 600; font-size: 1.02rem; border: 2px solid var(--gold); }
-  .btn.primary { background: var(--gold); color: var(--deep); }
-  .btn.primary:hover { background: var(--gold-bright); border-color: var(--gold-bright); color: var(--deep); }
+  .btn.primary { background: var(--gold); color: #000; }
+  .btn.primary:hover { background: var(--gold-bright); border-color: var(--gold-bright); color: #000; }
   .btn.secondary { color: var(--wool); }
-  .btn.secondary:hover { background: rgba(201,163,91,.12); color: var(--wool); }
+  .btn.secondary:hover { background: rgba(168,104,212,.14); color: var(--wool); }
 
   h2 { font: 400 clamp(1.7rem, 3.4vw, 2.3rem)/1.15 var(--serif); margin: 0 0 1.1rem; }
   h3 { font: 600 1.15rem/1.35 var(--sans); margin: 0 0 .35rem; color: var(--wool); }
@@ -111,15 +113,15 @@
   /* The launcher, as it looks in Terminal. */
   .launcher { background: var(--deep); border: 1px solid var(--rule); border-radius: 12px; overflow: hidden; margin: 1.5rem 0 .75rem;
               font: .88rem/1.55 var(--mono); max-width: 44rem; }
-  .launcher .bar { display: flex; gap: .45rem; padding: .6rem .8rem; background: #0c1533; border-bottom: 1px solid var(--rule); }
-  .launcher .bar i { width: 11px; height: 11px; border-radius: 50%; background: #2e3b66; display: block; }
-  .launcher .status { padding: .55rem 1rem; color: var(--wool); background: #121c3d; display: flex; flex-wrap: wrap; gap: .2rem 1.4rem; }
+  .launcher .bar { display: flex; gap: .45rem; padding: .6rem .8rem; background: #0b050f; border-bottom: 1px solid var(--rule); }
+  .launcher .bar i { width: 11px; height: 11px; border-radius: 50%; background: #2c1838; display: block; }
+  .launcher .status { padding: .55rem 1rem; color: var(--wool); background: #120818; display: flex; flex-wrap: wrap; gap: .2rem 1.4rem; }
   .launcher .status b { font-weight: 600; }
   .launcher .body { display: grid; grid-template-columns: 15.5rem 1fr; min-height: 15rem; }
   .launcher ul { list-style: none; margin: 0; padding: .6rem .5rem; border-right: 1px solid var(--rule); }
   .launcher li { padding: 0 .5rem; color: var(--wool-dim); white-space: nowrap; }
   .launcher li.group { color: var(--gold); font-weight: 600; padding-top: .55rem; }
-  .launcher li.on { background: #2a3766; color: var(--wool); border-radius: 3px; }
+  .launcher li.on { background: #3a1748; color: var(--wool); border-radius: 3px; }
   .launcher li kbd { font: inherit; color: var(--gold); margin-right: .55rem; }
   .launcher .side { padding: .9rem 1rem; color: var(--wool-dim); }
   .launcher .side strong { color: var(--wool); font-weight: 600; }
@@ -153,7 +155,9 @@
 <body>
 <div class="page">
   <svg class="thread" aria-hidden="true" preserveAspectRatio="none" viewBox="0 0 88 1000">
-    <path pathLength="1" d="M44 0 C 39 60, 49 120, 44 180 S 39 300, 44 360 S 49 480, 44 540 S 39 660, 44 720 S 49 840, 44 900 S 43 960, 44 1000"/>
+    <defs><filter id="soft" x="-200%" y="-5%" width="500%" height="110%"><feGaussianBlur stdDeviation="5"/></filter></defs>
+    <path class="glow" pathLength="1" d="M44 0 C 39 60, 49 120, 44 180 S 39 300, 44 360 S 49 480, 44 540 S 39 660, 44 720 S 49 840, 44 900 S 43 960, 44 1000"/>
+    <path class="core" pathLength="1" d="M44 0 C 39 60, 49 120, 44 180 S 39 300, 44 360 S 49 480, 44 540 S 39 660, 44 720 S 49 840, 44 900 S 43 960, 44 1000"/>
   </svg>
 
   <header class="top">
@@ -167,7 +171,7 @@
 
   <main>
     <section class="hero">
-      <img class="mark" src="icon-512.png" alt="The Distaph icon: a film strip spiraling around a spinning staff, turning into data, then a gold thread." width="132" height="132">
+      <img class="mark" src="icon-512.png" alt="The Distaph icon: a single violet thread glowing against black." width="132" height="132">
       <h1>Spin a lifetime of footage into stories.</h1>
       <p class="lede">Distaph catalogs every clip you've ever recorded, keeps your editorial judgments in files you own, and spins real moments from across the years into rough cuts that open in DaVinci Resolve.</p>
       <div class="actions">
