@@ -196,6 +196,50 @@ confirmed memberships to the vault + projection, and archives the note.
 Checkbox lines follow a strict format (`- [ ] clip_<id> → <slug> — <echo>`)
 because they are parsed, not read.
 
+### Deciding a possible dupe (amended 2026-11-23)
+
+Before this, a dupe pair could only be *dismissed* ("not duplicates"). There
+was no way to say "yes, same footage", so real duplicates came back on every
+sync. A pair now has two answers, and the note spells out which one you gave
+instead of relying on what a tick means:
+
+```
+- [ ] dupe clip_a ~ clip_b — duration (x.mov / y.mov)          undecided (as written by sync)
+- [x] different clip_a ~ clip_b — …                            not duplicates
+- [x] same clip_a ~ clip_b keep clip_a — …                     duplicates; clip_a is the one to keep
+```
+
+An old-style ticked `- [x] dupe a ~ b` still means "different", so notes
+already open keep working.
+
+`apply-review` records both answers in `vault/review/resolved-dupes.md`, the
+lasting record (renamed in its header to "Decided dupe pairs"):
+
+```
+- clip_a ~ clip_b — different 2026-11-23
+- clip_a ~ clip_b — same, keep clip_a 2026-11-23
+```
+
+Lines already in the file without "same" mean "different".
+
+What "same" does:
+- **The footage file is never touched.** It lives on your drive, and Distaph
+  doesn't delete or move it.
+- The extra copy gets `clip.duplicate_of = <kept clip id>`, a new column. Like
+  `clip_project`, this is a projection: `sync` rewrites it from
+  `resolved-dupes.md` on every run, so the database can still be rebuilt from
+  the vault. If a chain forms (b copy of a, c copy of b), it is followed to the
+  end.
+- Clips marked as copies are left out of search results, the "clips with no
+  project" count, tag proposals, and future dupe pairs. Their transcripts and
+  keyframes stay in the database, so undoing costs nothing.
+- The kept clip picks up any projects the copy was tagged with, written to the
+  vault like any other confirmed membership.
+- To undo: delete the line from `resolved-dupes.md` and run `sync`.
+
+This is still the cheap pairwise version. The `dup_cluster` table mentioned
+above remains the path if real clustering is ever needed.
+
 ## Resolved identity & naming decisions
 
 **Two different naming regimes, split by who creates the name and at what volume:**

@@ -94,7 +94,11 @@ Concurrency (amended 2026-11-21):
 Review (amended 2026-11-23): deciding needs the footage, not just IDs. The
 review screen (`r`) shows each item with a thumbnail (a cached frame from the
 first good keyframe), the opening transcript lines and keyframe captions, and
-plays the clip — both clips, for a possible dupe — in Quick Look. Decisions
+plays the clip — both clips, for a possible dupe — in QuickTime Player (not
+Quick Look: `qlmanage -p` crashes on every video on macOS 26). For a possible
+dupe the question is "Same footage?": `y` same (then `1`/`2` picks which clip
+to keep), `n` different (dismissed for good), `s` skip until next sync. `s`
+skips any item. See "Deciding a possible dupe" in `02-data-model.md`. Decisions
 are written into the review note as ticked/edited/removed lines, so the note
 stays the record and `apply-review` stays the only writer. The logic lives in
 `scripts/review.py`, separate from the screen, so a native app can replace the
