@@ -189,11 +189,16 @@ def thumbnail(cache: Path, clip: Clip) -> Path | None:
 
 
 def play(clips: list[Clip]) -> bool:
-    """Open clips in Quick Look, macOS's built-in player. Several clips open
-    together; arrow keys flip between them."""
+    """Open clips in QuickTime Player, one window each, so a possible
+    duplicate pair can be watched side by side.
+
+    Not `qlmanage -p`: on macOS 26 its video previewer crashes on every clip
+    ("Setting highlightedTimeRanges is not supported in your app")."""
     paths = [c.path for c in clips if c.exists]
     if not paths:
         return False
-    subprocess.Popen(["qlmanage", "-p", *paths], stdout=subprocess.DEVNULL,
-                     stderr=subprocess.DEVNULL, start_new_session=True)
+    r = subprocess.run(["open", "-a", "QuickTime Player", *paths],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode != 0:
+        raise RuntimeError(f"QuickTime Player didn't open: {r.stderr.strip()}")
     return True

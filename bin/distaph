@@ -613,7 +613,14 @@ def tui() -> int:
 
         def action_play(self) -> None:
             item = self.current()
-            if item and not review.play(item.clips):
+            if not item:
+                return
+            try:
+                ok = review.play(item.clips)
+            except RuntimeError as e:
+                self.notify(str(e), severity="error")
+                return
+            if not ok:
                 self.notify("Can't reach the file. Is the footage drive connected?",
                             severity="warning")
 
