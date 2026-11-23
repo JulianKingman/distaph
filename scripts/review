@@ -1,0 +1,58 @@
+#!/usr/bin/env -S uv run --script --quiet
+# /// script
+# requires-python = ">=3.12"
+# ///
+"""review — list the open review note's items with what's needed to decide them.
+
+Each item comes with its clip(s): file path, length, date, opening transcript
+lines and keyframe captions. Front ends (the launcher's review screen, or an
+app) use this; decisions are written back with the functions in review.py.
+
+Usage: distaph review [NOTE.md] [--config PATH] [--db PATH] [--json]
+"""
+
+import argparse
+import json
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from common import die, load_config, open_db, vault_path
+import review
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("note", nargs="?")
+    ap.add_argument("--config")
+    ap.add_argument("--db")
+    ap.add_argument("--json", action="store_true", dest="as_json")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    conn = open_db(cfg, args.db)
+    if args.note:
+        note = Path(args.note)
+    else:
+        notes = review.open_notes(vault_path(cfg))
+        if not notes:
+            die("no open review note — run `distaph sync` first")
+        note = notes[0]
+    items = review.load_items(note, conn)
+
+    if args.as_json:
+        print(json.dumps({"note": str(note), "items": [asdict(i) for i in items],
+                          "untagged_clips": review.untagged_clips(conn)}, indent=2))
+        return
+    print(note)
+    for i in items:
+        mark = "x" if i.ticked else " "
+        what = {"tag": f"→ {i.project}", "date": f"date = {i.date}",
+                "dupe": f"~ {i.clips[1].id}"}[i.kind]
+        print(f"[{mark}] {i.kind:4} {i.clips[0].id} {what}  ({i.clips[0].name})")
+
+
+if __name__ == "__main__":
+    main()

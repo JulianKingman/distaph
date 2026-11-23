@@ -37,8 +37,10 @@ in files you own.
 1. **Drop footage** in your intake folder.
 2. **Sync.** Distaph files it by content hash, dates it from metadata,
    transcribes it, captions keyframes and embeds everything.
-3. **Review in Obsidian.** Proposed project tags, undated clips and possible
-   duplicates arrive as a checklist. Tick what you agree with; apply.
+3. **Review.** Go through proposed project tags, undated clips and possible
+   duplicates one at a time, with a thumbnail and the transcript for each and
+   the clip itself a keypress away. Your decisions are recorded in a review
+   note in Obsidian; apply them when you're done.
 4. **Make something.** Describe a video, or start from a narrative. Claude
    picks and orders real segments; Distaph validates them and builds an
    FCPXML.
@@ -71,7 +73,7 @@ it. Nothing to memorize.
 | Key | Action | |
 |---|---|---|
 | s | Sync new footage | runs locally |
-| r | Review in Obsidian | opens the review note |
+| r | Review | each new clip with its thumbnail, transcript and captions; space plays it |
 | a | Apply review | runs locally |
 | f | Find footage | semantic search across every clip |
 | c | Make a cut… | hands off to Claude Code |

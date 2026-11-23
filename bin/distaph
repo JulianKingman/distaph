@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script --quiet
 # /// script
 # requires-python = ">=3.12"
-# dependencies = ["textual>=0.80"]
+# dependencies = ["textual>=0.80", "textual-image[textual]>=0.14"]
 # ///
 """distaph — the front door.
 
@@ -329,7 +329,9 @@ def tui() -> int:
     from textual.app import App, ComposeResult
     from textual.binding import Binding
     from textual.containers import Horizontal, Vertical, VerticalScroll
-    from textual.screen import ModalScreen
+    from textual.screen import ModalScreen, Screen
+    from textual_image.widget import Image as TImage
+    import review
     from textual.widgets import (Button, Footer, Header, Input, Label, ListItem, ListView,
                                  OptionList, RichLog, Static)
     from textual.widgets.option_list import Option
@@ -341,8 +343,9 @@ def tui() -> int:
         ("", "", "EVERY DAY", "", "section"),
         ("s", "sync", "Sync new footage",
          "Catalog everything in your intake folder: hash, date, transcribe, caption, embed.", "run"),
-        ("r", "review", "Review in Obsidian",
-         "Open the latest review note. Tick the proposals you agree with.", "open"),
+        ("r", "review", "Review",
+         "Go through new clips: watch each one, then confirm its project, date or dupe status.",
+         "open"),
         ("a", "apply", "Apply review",
          "Apply what you ticked. Unticked lines wait for next time.", "run"),
         ("f", "find", "Find footage",
@@ -466,6 +469,218 @@ def tui() -> int:
         def action_cancel(self) -> None:
             self.dismiss(False)
 
+    class ReviewScreen(Screen):
+        """One review item at a time, with its footage a keypress away."""
+        BINDINGS = [
+            Binding("escape", "back", "Back"),
+            Binding("space", "play", "Play"),
+            Binding("y", "yes", "Yes"),
+            Binding("n", "no", "No"),
+            Binding("t", "retag", "Other project"),
+            Binding("e", "date", "Enter date"),
+            Binding("u", "undo", "Undo"),
+            Binding("p", "propose", "Ask Claude for tags"),
+            Binding("o", "obsidian", "Open note"),
+            Binding("a", "apply", "Apply"),
+            Binding("r", "reload", "Reload", show=False),
+        ]
+
+        def __init__(self, note: Path, status: dict):
+            super().__init__()
+            self.note, self.status = note, status
+            self.items: list = []
+            self.thumbs_dir = library / ".distaph" / "thumbs"
+
+        def compose(self) -> ComposeResult:
+            yield Static(id="rv-head")
+            with Horizontal(id="rv-body"):
+                yield ListView(id="rv-list")
+                with Vertical(id="rv-detail"):
+                    with Horizontal(id="rv-thumbs"):
+                        yield TImage(None, id="rv-thumb-a")
+                        yield TImage(None, id="rv-thumb-b")
+                    yield Static(id="rv-info")
+            yield Footer()
+
+        def on_mount(self) -> None:
+            self.reload(0)
+
+        def db(self):
+            cfg = self.status["cfg"]
+            c = sqlite3.connect(common.resolve_path(cfg, cfg["db"]["path"]))
+            c.row_factory = sqlite3.Row
+            return c
+
+        def reload(self, index: int) -> None:
+            with self.db() as c:
+                self.items = review.load_items(self.note, c)
+                untagged = review.untagged_clips(c)
+            done = sum(i.ticked for i in self.items)
+            tags = sum(i.kind == "tag" for i in self.items)
+            head = (f"[b]Review[/] {self.note.name}    {done} of {len(self.items)} decided")
+            if not tags and untagged:
+                head += (f"    [#b07cd8]{untagged} clips have no project — "
+                         f"press p to have Claude propose some[/]")
+            self.query_one("#rv-head", Static).update(head)
+            lv = self.query_one("#rv-list", ListView)
+            lv.clear()
+            for i in self.items:
+                mark = "[#7ec699]✓[/]" if i.ticked else "[#8c8098]·[/]"
+                c = i.clips[0]
+                what = {"tag": f"→ {i.project}",
+                        "date": f"date {i.date if i.date_filled else '?'}",
+                        "dupe": "same as another?"}[i.kind]
+                lv.append(ListItem(Label(f"{mark} {c.name[:24]}  [#8c8098]{what}[/]")))
+            if self.items:
+                lv.index = min(index, len(self.items) - 1)
+                lv.focus()
+                self.show(self.items[lv.index])
+            else:
+                self.query_one("#rv-info", Static).update(
+                    "Nothing to decide in this note." + (
+                        f"\n\n{untagged} clips have no project yet. Press p and Claude will "
+                        f"propose some; press r afterwards to see them." if untagged else ""))
+
+        def current(self):
+            lv = self.query_one("#rv-list", ListView)
+            return self.items[lv.index] if self.items and lv.index is not None else None
+
+        @on(ListView.Highlighted, "#rv-list")
+        def highlighted(self, e: ListView.Highlighted) -> None:
+            if (item := self.current()):
+                self.show(item)
+
+        def describe(self, c) -> str:
+            mins = f"{int(c.duration_s // 60)}:{int(c.duration_s % 60):02d}" if c.duration_s else "?"
+            when = (c.capture_date or "no date")[:10]
+            out = [f"[b]{c.name}[/]  [#8c8098]{c.id} · {mins} · {when}"
+                   + (f" · in {', '.join(c.projects)}" if c.projects else "") + "[/]"]
+            if c.visual_summary:
+                out.append(c.visual_summary)
+            if c.transcript:
+                out.append(f"[#d2c8da]“{c.transcript[:400]}”[/]")
+            for t, cap in c.captions[:3]:
+                out.append(f"[#8c8098]{t:5.0f}s[/] {cap}")
+            if not c.exists:
+                out.append("[#e07a5f]File not reachable — is the footage drive connected?[/]")
+            return "\n".join(out)
+
+        def show(self, item) -> None:
+            q = {"tag": f"Tag as [b #b07cd8]{item.project}[/]?   "
+                        f"[#8c8098]y yes · n no · t other project · space play[/]",
+                 "date": "When was this filmed?   "
+                         "[#8c8098]e enter date · space play[/]"
+                         + (f"   [#7ec699]{item.date}[/]" if item.date_filled else ""),
+                 "dupe": "Are these the same footage?   "
+                         "[#8c8098]space plays both · y not duplicates · n skip[/]"}[item.kind]
+            if item.ticked:
+                q = "[#7ec699]Decided.[/] " + q + "   [#8c8098]u undo[/]"
+            body = [q, ""]
+            if item.note:
+                body.append(f"[#8c8098]{item.note}[/]")
+            for n, c in enumerate(item.clips):
+                if len(item.clips) > 1:
+                    body.append(f"\n[b #b07cd8]{'AB'[n]}[/]")
+                body.append(self.describe(c))
+            self.query_one("#rv-info", Static).update("\n".join(body))
+            b = self.query_one("#rv-thumb-b")
+            b.display = len(item.clips) > 1
+            self.load_thumbs(item)
+
+        @work(thread=True, exclusive=True, group="thumbs")
+        def load_thumbs(self, item) -> None:
+            for n, c in enumerate(item.clips[:2]):
+                path = review.thumbnail(self.thumbs_dir, c)
+                self.app.call_from_thread(self.set_thumb, n, path)
+
+        def set_thumb(self, n: int, path) -> None:
+            w = self.query_one(f"#rv-thumb-{'ab'[n]}")
+            w.image = str(path) if path else None
+
+        # --------------------------------------------------------- decisions
+
+        def decide(self, fn, *args) -> None:
+            item = self.current()
+            if not item:
+                return
+            index = self.query_one("#rv-list", ListView).index or 0
+            try:
+                fn(self.note, item, *args)
+            except ValueError as e:
+                self.notify(str(e), severity="warning")
+                return
+            self.reload(index + (1 if fn is not review.undo else 0))
+
+        def action_play(self) -> None:
+            item = self.current()
+            if item and not review.play(item.clips):
+                self.notify("Can't reach the file. Is the footage drive connected?",
+                            severity="warning")
+
+        def action_yes(self) -> None:
+            item = self.current()
+            if item and item.kind == "date" and not item.date_filled:
+                return self.action_date()
+            self.decide(review.accept)
+
+        def action_no(self) -> None:
+            item = self.current()
+            if item and item.kind == "tag":
+                self.decide(review.reject)
+            elif item:  # dates and dupes: leave for later; they come back next sync
+                lv = self.query_one("#rv-list", ListView)
+                lv.index = min((lv.index or 0) + 1, len(self.items) - 1)
+
+        def action_undo(self) -> None:
+            self.decide(review.undo)
+
+        def action_retag(self) -> None:
+            item = self.current()
+            if not item or item.kind != "tag":
+                return
+            options = [(p, p) for p in self.status["projects"]]
+            self.app.push_screen(Pick("Which project?", options),
+                                 lambda slug: slug and self.decide(review.retag, slug))
+
+        def action_date(self) -> None:
+            item = self.current()
+            if not item or item.kind != "date":
+                return
+            self.app.push_screen(Ask("When was this filmed?", "YYYY-MM-DD"),
+                                 lambda v: v and self.decide(review.set_date, v))
+
+        def action_propose(self) -> None:
+            rel = self.note.relative_to(library).as_posix()
+            self.app.hand_off(
+                "Use the distaph skill (classify). Read the project notes in vault/projects/, "
+                "then for clips that have no project yet, propose project tags by appending "
+                f"lines under '## proposals' in {rel}, in exactly this form: "
+                "`- [ ] clip_xxx → project/slug — short reason`. Base each on the clip's "
+                "transcript and keyframe captions. Don't tick anything; I'll review them in "
+                "Distaph. Tell me when you're done.")
+            self.notify("Claude is proposing tags in another window. Press r here when it's done.")
+
+        def action_reload(self) -> None:
+            self.reload(self.query_one("#rv-list", ListView).index or 0)
+
+        def action_obsidian(self) -> None:
+            vault = self.status["vault"]
+            from urllib.parse import quote
+            rel = self.note.relative_to(vault).as_posix()
+            subprocess.call(["open", f"obsidian://open?vault={quote(vault.name)}&file={quote(rel)}"],
+                            stderr=subprocess.DEVNULL)
+
+        def action_apply(self) -> None:
+            if not any(i.ticked for i in self.items):
+                self.notify("Nothing decided yet.", severity="warning")
+                return
+            self.app.pop_screen()
+            self.app.start("Applying review", "apply-review", [str(self.note)])
+
+        def action_back(self) -> None:
+            self.app.pop_screen()
+            self.app.refresh_status()
+
     class Launcher(App):
         TITLE = "Distaph"
         CSS = """
@@ -487,6 +702,15 @@ def tui() -> int:
         #dialog-title { text-style: bold; color: #eee8f2; padding-bottom: 1; }
         #dialog-options { height: auto; max-height: 20; }
         Ask, Pick, Settings { align: center middle; }
+        ReviewScreen { background: #000000; }
+        #rv-head { height: auto; padding: 1 2; background: #120818; color: #eee8f2; }
+        #rv-body { height: 1fr; }
+        #rv-list { width: 46; border-right: solid #3a1748; background: #000000; }
+        #rv-list > ListItem.--highlight { background: #3a1748; }
+        #rv-detail { padding: 1 2; }
+        #rv-thumbs { height: 16; }
+        #rv-thumbs TImage { width: 48; height: 16; margin-right: 2; }
+        #rv-info { height: 1fr; color: #eee8f2; }
         #settings { width: 84; height: 90%; padding: 1 2; background: #120818;
                     border: round #b07cd8; }
         #settings Input { margin-bottom: 0; }
@@ -659,6 +883,8 @@ def tui() -> int:
                 self.say(f"{name} isn't connected. Plug it in — Distaph will notice.")
 
         def action_act(self, ident: str) -> None:
+            if len(self.screen_stack) > 1:   # a screen like Review is open; its keys win
+                return
             getattr(self, f"do_{ident}")()
 
         def writer_running(self) -> str | None:
@@ -713,16 +939,12 @@ def tui() -> int:
                 return
             notes = self.status_["open_notes"]
             if not notes:
-                self.say("Nothing to review right now.")
+                self.say("Nothing to review right now. Sync new footage first.")
                 return
-            note = notes[0]
-            vault = self.status_["vault"]
-            rel = note.relative_to(vault).as_posix()
-            from urllib.parse import quote
-            url = f"obsidian://open?vault={quote(vault.name)}&file={quote(rel)}"
-            if subprocess.call(["open", url], stderr=subprocess.DEVNULL) != 0:
-                subprocess.call(["open", str(note)])
-            self.say(f"Opened [b]{rel}[/]. Tick what you agree with, then press [b]a[/].")
+            if not self.status_["mounted"]:
+                self.say("[#e07a5f]Your footage drive isn't connected[/], so clips won't play "
+                         "or show thumbnails. You can still read and decide.")
+            self.push_screen(ReviewScreen(notes[0], self.status_))
 
         def do_folder(self) -> None:
             subprocess.call(["open", str(library)])

@@ -91,6 +91,16 @@ Concurrency (amended 2026-11-21):
   to eject while a job is using it. A job interrupted by a disconnect is safe
   to rerun: every stage is idempotent.
 
+Review (amended 2026-11-23): deciding needs the footage, not just IDs. The
+review screen (`r`) shows each item with a thumbnail (a cached frame from the
+first good keyframe), the opening transcript lines and keyframe captions, and
+plays the clip — both clips, for a possible dupe — in Quick Look. Decisions
+are written into the review note as ticked/edited/removed lines, so the note
+stays the record and `apply-review` stays the only writer. The logic lives in
+`scripts/review.py`, separate from the screen, so a native app can replace the
+screen without redoing it. Clips with no project prompt a one-key hand-off to
+Claude to write tag proposals into the note.
+
 Settings are edited from the launcher (`,`), not by hand: footage folders and
 the three local models (with whether each is downloaded), plus how Claude is
 connected (Claude Code, signed in with the user's own account — Distaph holds
